@@ -1,0 +1,79 @@
+use crate::cache::PriceCache;
+use futures_util::{SinkExt, StreamExt};
+use log::{info, warn};
+use rust_decimal::Decimal;
+use serde_json::Value;
+use tokio::time::{sleep, Duration};
+use tokio_tungstenite::connect_async;
+use url::Url;
+
+pub async fn start_ws(
+    ws_url: String,
+    cache: PriceCache,
+    token_ids: Vec<String>,
+) {
+    loop {
+        info!("🔌 Connecting to Polymarket WebSocket");
+
+        if let Err(e) = connect_and_stream(&ws_url, &cache, &token_ids).await {
+            warn!("⚠️ WS error: {} — reconnecting in 2s", e);
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+async fn connect_and_stream(
+    ws_url: &str,
+    cache: &PriceCache,
+    token_ids: &Vec<String>,
+) -> anyhow::Result<()> {
+    let (ws, _) = connect_async(Url::parse(ws_url)?).await?;
+    let (mut write, mut read) = ws.split();
+
+    // --------------------------------------------------
+    // SUBSCRIBE
+    // --------------------------------------------------
+    let sub = serde_json::json!({
+        "type": "subscribe",
+        "channels": [{
+            "name": "prices",
+            "tokens": token_ids
+        }]
+    });
+
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            sub.to_string(),
+        ))
+        .await?;
+
+    info!("📡 Subscribed to price feed");
+
+    // --------------------------------------------------
+    // READ LOOP
+    // --------------------------------------------------
+    while let Some(msg) = read.next().await {
+        let msg = msg?;
+
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                if let Some(token_id) = json.get("token_id").and_then(|v| v.as_str()) {
+                    let bid = json
+                        .get("bid")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Decimal>().ok());
+
+                    let ask = json
+                        .get("ask")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Decimal>().ok());
+
+                    
+                }
+            }
+        }
+    }
+
+    // If we exit the read loop → WS disconnected
+    Err(anyhow::anyhow!("WebSocket disconnected"))
+}

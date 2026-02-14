@@ -1,0 +1,168 @@
+use crate::client::PolymarketClient;
+use crate::domain::*;
+use crate::execution::orderbook::fetch_orderbook;
+use anyhow::Result;
+use log::{debug, info, warn};
+use rust_decimal::Decimal;
+use std::env;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use tokio::try_join;
+
+pub struct MarketMonitor {
+    api: Arc<PolymarketClient>,
+    eth_market: Market,
+    btc_market: Market,
+    check_interval: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketSnapshot {
+    pub eth_market: MarketData,
+    pub btc_market: MarketData,
+    pub timestamp: std::time::Instant,
+}
+
+impl MarketMonitor {
+    pub fn new(
+        api: Arc<PolymarketClient>,
+        eth_market: Market,
+        btc_market: Market,
+        check_interval_ms: u64,
+    ) -> Self {
+        Self {
+            api,
+            eth_market,
+            btc_market,
+            check_interval: Duration::from_millis(check_interval_ms),
+        }
+    }
+
+    pub async fn start_monitoring<F, Fut>(&self, on_snapshot: F)
+    where
+        F: Fn(MarketSnapshot) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        info!("🎬 Monitor starting...");
+
+        loop {
+            match self.fetch_snapshot().await {
+                Ok(snapshot) => on_snapshot(snapshot).await,
+                Err(e) => warn!("📊 Snapshot error: {}", e),
+            }
+
+            sleep(self.check_interval).await;
+        }
+    }
+
+    async fn fetch_snapshot(&self) -> Result<MarketSnapshot> {
+        let (eth_market, btc_market) = try_join!(
+            self.build_market("ETH", &self.eth_market),
+            self.build_market("BTC", &self.btc_market),
+        )?;
+
+        Ok(MarketSnapshot {
+            eth_market,
+            btc_market,
+            timestamp: std::time::Instant::now(),
+        })
+    }
+
+    async fn build_market(&self, name: &str, market: &Market) -> Result<MarketData> {
+        let token_ids_str = market
+            .clob_token_ids
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} market missing clob_token_ids", name))?;
+
+        let token_ids: Vec<String> = serde_json::from_str(token_ids_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {} token IDs: {}", name, e))?;
+
+        if token_ids.len() < 2 {
+            return Err(anyhow::anyhow!("{} market has less than 2 tokens", name));
+        }
+
+        let up_token_id = &token_ids[0];
+        let down_token_id = &token_ids[1];
+
+        let (
+            (up_bid, up_ask, up_bid_size, up_ask_size),
+            (down_bid, down_ask, down_bid_size, down_ask_size),
+        ) = tokio::join!(
+            self.fetch_token_top(name, "UP", up_token_id),
+            self.fetch_token_top(name, "DOWN", down_token_id),
+        );
+
+        Ok(MarketData {
+            condition_id: market.condition_id.clone(),
+            market_name: name.to_string(),
+            up_token: Some(TokenPrice {
+                token_id: up_token_id.clone(),
+                bid: up_bid,
+                ask: up_ask,
+                bid_size: up_bid_size,
+                ask_size: up_ask_size,
+            }),
+            down_token: Some(TokenPrice {
+                token_id: down_token_id.clone(),
+                bid: down_bid,
+                ask: down_ask,
+                bid_size: down_bid_size,
+                ask_size: down_ask_size,
+            }),
+        })
+    }
+
+    async fn fetch_token_top(
+        &self,
+        market_name: &str,
+        outcome_name: &str,
+        token_id: &str,
+    ) -> (
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+    ) {
+        match fetch_orderbook(&self.api, token_id).await {
+            Ok(book) => {
+                let required_shares = env::var("MIN_SHARES")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(5.0);
+
+                let best_bid = book
+                    .best_bid()
+                    .map(|(price, _)| Decimal::from_f64_retain(price).unwrap_or(Decimal::ZERO));
+                let best_bid_size = book
+                    .best_bid()
+                    .map(|(_, size)| Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO));
+
+                let selected_ask = book
+                    .cheapest_ask_with_min_size(required_shares)
+                    .or_else(|| book.best_ask());
+                let best_ask = selected_ask
+                    .map(|(price, _)| Decimal::from_f64_retain(price).unwrap_or(Decimal::ZERO));
+                let best_ask_size = selected_ask
+                    .map(|(_, size)| Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO));
+
+                if let (Some(b), Some(a), Some(bs), Some(asks)) =
+                    (best_bid, best_ask, best_bid_size, best_ask_size)
+                {
+                    debug!(
+                        "📊 {} {} | bid: {} x {} | ask(selected >= {} shares): {} x {}",
+                        market_name, outcome_name, b, bs, required_shares, a, asks
+                    );
+                }
+
+                (best_bid, best_ask, best_bid_size, best_ask_size)
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️  Failed to fetch {} {} prices: {}",
+                    market_name, outcome_name, e
+                );
+                (None, None, None, None)
+            }
+        }
+    }
+}
