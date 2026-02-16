@@ -30,6 +30,12 @@ pub struct ExecuteOrderResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CashoutRequest {
+    pub token_id: String,
+    pub size_usdc: f64,
+}
+
 impl ExecutorClient {
     pub fn new(base_url: String) -> Result<Self> {
         let http = Client::builder()
@@ -146,6 +152,59 @@ impl ExecutorClient {
         if !parsed.ok {
             return Err(anyhow!(
                 "executor rejected order intent (status {}): {}",
+                status,
+                parsed.error.unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+
+        Ok(parsed)
+    }
+
+    pub async fn cashout_position(
+        &self,
+        token_id: &str,
+        size_usdc: f64,
+    ) -> Result<ExecuteOrderResponse> {
+        let url = format!("{}/cashout", self.base_url.trim_end_matches('/'));
+
+        let payload = CashoutRequest {
+            token_id: token_id.to_string(),
+            size_usdc,
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send cashout intent to executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor cashout response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor rejected cashout intent (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: ExecuteOrderResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for cashout success response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor rejected cashout intent (status {}): {}",
                 status,
                 parsed.error.unwrap_or_else(|| "unknown error".to_string())
             ));
