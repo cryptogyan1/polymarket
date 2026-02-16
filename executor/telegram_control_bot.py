@@ -28,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 from web3 import Web3
+from web3.exceptions import TimeExhausted
 
 from executor.app import CLIENT, MAX_SHARES, MIN_SHARES
 from executor.position_guard import PositionGuard
@@ -175,6 +176,24 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
         if len(cond_bytes) != 32:
             continue
 
+        fee_params: Dict[str, int] = {}
+        try:
+            # Polygon gas can spike quickly; hardcoded fees often leave txs pending.
+            latest_block = w3.eth.get_block("latest")
+            base_fee = int(latest_block.get("baseFeePerGas", 0) or 0)
+            priority_fee = int(w3.eth.max_priority_fee)
+            if priority_fee <= 0:
+                priority_fee = w3.to_wei("30", "gwei")
+            fee_params = {
+                "maxPriorityFeePerGas": priority_fee,
+                # Use a multiplier so tx remains valid during short-lived fee spikes.
+                "maxFeePerGas": max(base_fee * 2 + priority_fee, priority_fee),
+            }
+        except Exception:
+            # Fallback for RPCs without EIP-1559 helpers.
+            gas_price = int(w3.eth.gas_price)
+            fee_params = {"gasPrice": max(gas_price, w3.to_wei("50", "gwei"))}
+
         txn = ctf.functions.redeemPositions(
             USDC_ADDRESS,
             b"\x00" * 32,
@@ -185,15 +204,21 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
                 "from": acct.address,
                 "nonce": nonce,
                 "gas": 500_000,
-                "maxFeePerGas": w3.to_wei("60", "gwei"),
-                "maxPriorityFeePerGas": w3.to_wei("35", "gwei"),
                 "chainId": w3.eth.chain_id,
+                **fee_params,
             }
         )
 
         signed = acct.sign_transaction(txn)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction)
         tx_hashes.append(txh.hex())
+
+        # Best-effort confirmation check to surface stuck txs early in chat output.
+        try:
+            w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+        except TimeExhausted:
+            pass
+
         nonce += 1
 
     return tx_hashes
