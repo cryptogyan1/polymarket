@@ -43,7 +43,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PROXY_WALLET = os.getenv("PROXY_WALLET", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
-TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", os.getenv("RPC_URL", ""))
+TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", "")
 
 
 def _clean_env(name: str) -> str:
@@ -180,7 +180,7 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
 
     if not rpc_url:
         raise RuntimeError(
-            "CLAIM missing RPC URL. Set TELEGRAM_CONTROL_RPC_URL (preferred) or RPC_URL/POLYGON_RPC_URL."
+            "CLAIM missing RPC URL. Set TELEGRAM_CONTROL_RPC_URL (preferred) or POLYGON_RPC_URL."
         )
     if not private_key:
         raise RuntimeError("PRIVATE_KEY is required for CLAIM")
@@ -214,6 +214,15 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
         )
 
     acct = w3.eth.account.from_key(private_key)
+
+    if wallet and wallet.lower() != acct.address.lower():
+        raise RuntimeError(
+            "CLAIM wallet/signing-key mismatch: "
+            f"positions are being read from {wallet}, but txs are signed by {acct.address}. "
+            "redeemPositions only redeems balances owned by the signing wallet. "
+            "Set PROXY_WALLET to the signer address for CLAIM, or use the private key for the wallet that holds positions."
+        )
+
     ctf = w3.eth.contract(address=CTF_CONTRACT, abi=CTF_ABI)
 
     tx_hashes: List[str] = []
