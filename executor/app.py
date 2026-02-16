@@ -14,7 +14,7 @@ try:
     from eth_account import Account
     from eth_utils import is_address, to_checksum_address
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY, SELL
 except Exception as exc:
     raise RuntimeError(
