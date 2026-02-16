@@ -122,20 +122,74 @@ def _extract_token_id(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def fetch_open_positions(wallet: str) -> List[PositionRow]:
+
+
+def _fetch_positions_rows(wallet: str, extra_params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     url = f"{DATA_API_URL.rstrip('/')}/positions"
-    params = {"user": wallet, "sizeThreshold": "0"}
+    params: Dict[str, str] = {"user": wallet, "sizeThreshold": "0"}
+    if extra_params:
+        params.update(extra_params)
+
     resp = requests.get(url, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-
     if not isinstance(data, list):
         return []
+    return [row for row in data if isinstance(row, dict)]
+
+
+def _extract_claimable_condition_ids(wallet: str) -> List[str]:
+    # The data API shape can vary by market state/provider. Query a few safe variants
+    # and aggregate claimable/resolved condition IDs.
+    variants = [
+        {},
+        {"limit": "500", "offset": "0"},
+        {"redeemable": "true"},
+        {"claimable": "true"},
+        {"closed": "true", "limit": "500", "offset": "0"},
+    ]
+
+    condition_ids: set[str] = set()
+    for variant in variants:
+        try:
+            rows = _fetch_positions_rows(wallet, variant)
+        except Exception:
+            continue
+
+        for row in rows:
+            condition_id = row.get("conditionId") or row.get("condition_id")
+            if not condition_id:
+                continue
+
+            resolved_or_claimable = bool(
+                row.get("resolved")
+                or row.get("isResolved")
+                or row.get("redeemable")
+                or row.get("claimable")
+            )
+            if not resolved_or_claimable:
+                continue
+
+            # Some payloads include explicit "already redeemed" markers.
+            already_redeemed = bool(row.get("redeemed") or row.get("isRedeemed"))
+            if already_redeemed:
+                continue
+
+            shares = _normalize_share(row)
+            has_size_signal = shares > 0 or row.get("claimable") or row.get("redeemable")
+            if not has_size_signal:
+                continue
+
+            condition_ids.add(str(condition_id))
+
+    return sorted(condition_ids)
+
+
+def fetch_open_positions(wallet: str) -> List[PositionRow]:
+    data = _fetch_positions_rows(wallet)
 
     out: List[PositionRow] = []
     for row in data:
-        if not isinstance(row, dict):
-            continue
         token_id = _extract_token_id(row)
         if not token_id:
             continue
@@ -212,11 +266,7 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
     if wallet and wallet.lower() != acct.address.lower():
         lookup_wallet = acct.address
 
-    positions = fetch_open_positions(lookup_wallet)
-    settled_conditions = sorted(
-        {p.condition_id for p in positions if p.condition_id and p.resolved}
-    )
-
+    settled_conditions = _extract_claimable_condition_ids(lookup_wallet)
     if not settled_conditions:
         return []
 
