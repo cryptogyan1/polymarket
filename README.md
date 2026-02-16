@@ -29,6 +29,10 @@ EXECUTOR_URL=http://127.0.0.1:8787
 POLY_SIGNATURE_TYPE=2
 # optional: Fill-Or-Kill execution in executor mode
 FOK=false
+# pair selection (enable exactly one)
+PAIR_BTC_ETH=true
+PAIR_BTC_SOL=false
+PAIR_BTC_XRP=false
 # optional: per market-window cap, per direction (0 = unlimited)
 MAX_TRADES_PER_DIRECTION_PER_WINDOW=2
 # optional: max share exposure per market condition (0/unset = unlimited)
@@ -134,6 +138,12 @@ Each candidate must satisfy:
 
 - strict fixed share mode is enforced when `STRICT_SHARE_BOUNDS=true` and `MIN_SHARES == MAX_SHARES`:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
+
+- pair toggles in env (enable exactly one):
+  - `PAIR_BTC_ETH=true` trades BTC/ETH 15m pair
+  - `PAIR_BTC_SOL=true` trades BTC/SOL 15m pair
+  - `PAIR_BTC_XRP=true` trades BTC/XRP 15m pair
+  - bot rejects startup if none or multiple toggles are enabled
 
 - one-leg fail-safe unwind in executor mode:
   - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures

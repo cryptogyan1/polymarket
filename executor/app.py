@@ -273,6 +273,33 @@ else:
     NOTIFIER = None
 
 
+
+
+def _env_bool_any(keys, default: Optional[bool] = None) -> Optional[bool]:
+    for key in keys:
+        raw = os.getenv(key)
+        if raw is not None:
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def configured_pair_name() -> str:
+    btc_eth_raw = _env_bool_any(["PAIR_BTC_ETH", "BTC_ETH", "BTC-ETH"], None)
+    btc_sol_raw = _env_bool_any(["PAIR_BTC_SOL", "BTC_SOL", "BTC-SOL"], None)
+    btc_xrp_raw = _env_bool_any(["PAIR_BTC_XRP", "BTC_XRP", "BTC-XRP"], None)
+
+    any_explicit = any(v is not None for v in [btc_eth_raw, btc_sol_raw, btc_xrp_raw])
+    btc_eth = btc_eth_raw if btc_eth_raw is not None else (not any_explicit)
+    btc_sol = btc_sol_raw or False
+    btc_xrp = btc_xrp_raw or False
+
+    if btc_sol and not btc_eth and not btc_xrp:
+        return "BTC-SOL"
+    if btc_xrp and not btc_eth and not btc_sol:
+        return "BTC-XRP"
+    return "BTC-ETH"
+
+
 def send_telegram_notification(coro) -> None:
     if NOTIFIER is None:
         return
@@ -358,6 +385,7 @@ def cashout(req: CashoutRequest):
         token=req.token_id,
         shares_to_sell=float(req.shares or 0.0),
         original_cost=0.0,
+        original_direction=configured_pair_name(),
     )
     if NOTIFIER:
         send_telegram_notification(NOTIFIER.send_unwind_initiated(unwind_info))

@@ -151,11 +151,14 @@ Bot will attempt automatic unwind.
         )
 
     async def send_unwind_initiated(self, unwind: UnwindInfo) -> int:
+        direction_line = (
+            f"Pair: {unwind.original_direction}\n" if unwind.original_direction else ""
+        )
         message = f"""🔄 <b>UNWINDING POSITION</b>
 
 ⚠️ Emergency exit initiated
 ⏰ {unwind.timestamp}
-
+{direction_line}
 <b>UNWINDING:</b>
 📉 Selling: <b>{unwind.shares_to_sell:.0f} {unwind.token} shares</b>
 💵 Original Cost: ${unwind.original_cost:.2f} USDC
