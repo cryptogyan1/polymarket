@@ -153,6 +153,7 @@ Each candidate must satisfy:
   - `TRACK` fetches current open positions + held shares from Polymarket data API
   - `KILL` cashes out all open positions immediately using `PositionGuard`
   - `CLAIM` submits onchain `redeemPositions` txs for settled positions
+  - CLAIM checks settled positions for the signer wallet derived from `PRIVATE_KEY` (redeem is signer-owned onchain)
   - uses `TELEGRAM_CONTROL_RPC_URL` (or falls back to `POLYGON_RPC_URL`) for CLAIM tx execution
 
 - optional Telegram notifications in executor mode:

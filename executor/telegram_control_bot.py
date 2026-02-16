@@ -185,14 +185,6 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
     if not private_key:
         raise RuntimeError("PRIVATE_KEY is required for CLAIM")
 
-    positions = fetch_open_positions(wallet)
-    settled_conditions = sorted(
-        {p.condition_id for p in positions if p.condition_id and p.resolved}
-    )
-
-    if not settled_conditions:
-        return []
-
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
     try:
         connected = w3.is_connected()
@@ -215,13 +207,18 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
 
     acct = w3.eth.account.from_key(private_key)
 
+    # redeemPositions redeems only balances owned by the signing address.
+    lookup_wallet = wallet
     if wallet and wallet.lower() != acct.address.lower():
-        raise RuntimeError(
-            "CLAIM wallet/signing-key mismatch: "
-            f"positions are being read from {wallet}, but txs are signed by {acct.address}. "
-            "redeemPositions only redeems balances owned by the signing wallet. "
-            "Set PROXY_WALLET to the signer address for CLAIM, or use the private key for the wallet that holds positions."
-        )
+        lookup_wallet = acct.address
+
+    positions = fetch_open_positions(lookup_wallet)
+    settled_conditions = sorted(
+        {p.condition_id for p in positions if p.condition_id and p.resolved}
+    )
+
+    if not settled_conditions:
+        return []
 
     ctf = w3.eth.contract(address=CTF_CONTRACT, abi=CTF_ABI)
 
