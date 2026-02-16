@@ -138,6 +138,11 @@ Each candidate must satisfy:
 - one-leg fail-safe unwind in executor mode:
   - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures
 
+- optional Telegram notifications in executor mode:
+  - set `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`
+  - `/cashout` sends unwind initiated/completed/failed alerts
+  - `/notify` endpoint accepts structured events (`success`, `partial`, `unwind_start`, `unwind_complete`) so Rust can push trade notifications
+
 
 - per-direction trade cap per 15m market window via `MAX_TRADES_PER_DIRECTION_PER_WINDOW`:
   - cap is tracked separately for each pair direction (`ETH_UP + BTC_DOWN` and `ETH_DOWN + BTC_UP`)
