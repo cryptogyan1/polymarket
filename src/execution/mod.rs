@@ -337,14 +337,29 @@ impl Trader {
             ));
         }
 
+        // Allow short settlement window so balance snapshots catch up before unwind.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let safe_unwind_shares = (size_shares * 0.99).max(0.0);
+        if safe_unwind_shares <= 0.0 {
+            return Err(anyhow!(
+                "cannot unwind {} leg because safety-adjusted shares are non-positive: {:.4}",
+                leg_label,
+                safe_unwind_shares
+            ));
+        }
+
         let resp = executor
-            .cashout_position(token_id, size_shares)
+            .cashout_position(token_id, safe_unwind_shares)
             .await
             .with_context(|| format!("failed to cashout {} leg", leg_label))?;
 
         warn!(
-            "🧯 Emergency unwind executed via cashout | leg={} order_id={:?} size={:.4}",
-            leg_label, resp.order_id, size_shares
+            "🧯 Emergency unwind executed via cashout | leg={} order_id={:?} requested_shares={:.4} settled_shares={:?}",
+            leg_label,
+            resp.order_id,
+            safe_unwind_shares,
+            resp.requested_shares
         );
 
         Ok(())

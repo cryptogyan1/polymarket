@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from executor.position_guard import PositionGuard
+
 try:
     from eth_account import Account
     from eth_utils import is_address, to_checksum_address
@@ -55,7 +57,15 @@ class ExecuteOrderResponse(BaseModel):
 
 class CashoutRequest(BaseModel):
     token_id: str
-    size_usdc: float = Field(gt=0.0)
+    shares: Optional[float] = Field(default=None, gt=0.0)
+
+
+class CashoutResponse(BaseModel):
+    ok: bool
+    token_id: str
+    requested_shares: Optional[float] = None
+    order_id: Optional[str] = None
+    error: Optional[str] = None
 
 
 def clamp_order_size(raw_size: float, side: int) -> float:
@@ -230,6 +240,7 @@ def init_client() -> ClobClient:
 
 
 CLIENT = init_client()
+GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
 
 
 @app.get("/health")
@@ -285,26 +296,23 @@ def execute(req: ExecuteOrderRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/cashout", response_model=ExecuteOrderResponse)
+@app.post("/cashout", response_model=CashoutResponse)
 def cashout(req: CashoutRequest):
+    """Unwind position using GTC market order (no $1 minimum)."""
     try:
-        clamped_size = clamp_order_size(req.size_usdc, SELL)
-        order_args = MarketOrderArgs(
+        result = GUARD.cashout_market(
             token_id=req.token_id,
-            amount=clamped_size,
-            side=SELL,
-            fee_rate_bps=resolve_fee_rate_bps() or 0,
-            order_type=OrderType.FOK,
+            shares=req.shares,
+            max_retries=3,
+            retry_delay_ms=300,
         )
-
-        signed = CLIENT.create_market_order(order_args)
-        result = CLIENT.post_order(signed, OrderType.FOK)
-
-        order_id = None
-        if isinstance(result, dict):
-            order_id = result.get("orderID") or result.get("order_id")
-
-        return ExecuteOrderResponse(ok=True, order_id=order_id)
+        return CashoutResponse(
+            ok=result.ok,
+            token_id=result.token_id,
+            requested_shares=result.requested_shares,
+            order_id=result.order_id,
+            error=result.error,
+        )
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc))

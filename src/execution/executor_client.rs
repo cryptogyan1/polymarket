@@ -33,7 +33,16 @@ pub struct ExecuteOrderResponse {
 #[derive(Debug, Serialize)]
 pub struct CashoutRequest {
     pub token_id: String,
-    pub size_usdc: f64,
+    pub shares: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CashoutResponse {
+    pub ok: bool,
+    pub token_id: String,
+    pub requested_shares: Option<f64>,
+    pub order_id: Option<String>,
+    pub error: Option<String>,
 }
 
 impl ExecutorClient {
@@ -160,16 +169,12 @@ impl ExecutorClient {
         Ok(parsed)
     }
 
-    pub async fn cashout_position(
-        &self,
-        token_id: &str,
-        size_usdc: f64,
-    ) -> Result<ExecuteOrderResponse> {
+    pub async fn cashout_position(&self, token_id: &str, shares: f64) -> Result<CashoutResponse> {
         let url = format!("{}/cashout", self.base_url.trim_end_matches('/'));
 
         let payload = CashoutRequest {
             token_id: token_id.to_string(),
-            size_usdc,
+            shares: Some(shares),
         };
 
         let resp = self
@@ -195,7 +200,7 @@ impl ExecutorClient {
             ));
         }
 
-        let parsed: ExecuteOrderResponse = serde_json::from_str(&body).with_context(|| {
+        let parsed: CashoutResponse = serde_json::from_str(&body).with_context(|| {
             format!(
                 "executor returned invalid JSON for cashout success response: {}",
                 body
