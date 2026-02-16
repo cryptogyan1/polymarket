@@ -120,6 +120,8 @@ Notes:
 ARBITRAGE_MAX_SUM=0.985
 MIN_SHARES=5
 MAX_SHARES=25
+STRICT_SHARE_BOUNDS=true
+FORCE_TAKER_UNWIND=true
 
 
 Strategy pair logic (only these two combinations are considered):
@@ -130,6 +132,14 @@ Each candidate must satisfy:
 - `sum(ask_prices) < ARBITRAGE_MAX_SUM`
 - `max_shares_at_ask >= MIN_SHARES` where `max_shares_at_ask = min(ETH_ask_size, BTC_ask_size)`
 - execution buys equal shares on both legs, additionally capped by optional `MAX_SHARES`.
+
+- strict fixed share mode is enforced when `STRICT_SHARE_BOUNDS=true` and `MIN_SHARES == MAX_SHARES`:
+  - the bot will submit exactly that share size or skip the trade (never more / never less)
+
+- one-leg fail-safe unwind in executor mode:
+  - if one leg is placed and the other leg fails, bot immediately sends FOK sell on the filled leg
+  - with `FORCE_TAKER_UNWIND=true`, unwind uses an aggressive low limit (clamped to 0.01 exchange minimum) to prioritize immediate exit
+
 
 - per-direction trade cap per 15m market window via `MAX_TRADES_PER_DIRECTION_PER_WINDOW`:
   - cap is tracked separately for each pair direction (`ETH_UP + BTC_DOWN` and `ETH_DOWN + BTC_UP`)

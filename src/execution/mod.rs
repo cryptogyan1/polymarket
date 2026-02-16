@@ -9,7 +9,7 @@ use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConf
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
@@ -39,6 +39,7 @@ struct ExecutionEnv {
     trade_fee_bps: f64,
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
+    force_taker_unwind: bool,
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -96,6 +97,10 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0),
+        force_taker_unwind: std::env::var("FORCE_TAKER_UNWIND")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .eq_ignore_ascii_case("true"),
     }
 }
 
@@ -150,6 +155,10 @@ fn slippage_bps_from_env() -> f64 {
 
 fn max_total_shares_per_market_from_env() -> Option<f64> {
     env_settings().max_total_shares_per_market
+}
+
+fn force_taker_unwind_from_env() -> bool {
+    env_settings().force_taker_unwind
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -293,6 +302,94 @@ impl Trader {
     ) {
         state.add_shares(condition_id, shares);
         state.add_effective_cost(condition_id, shares * effective_price_per_share);
+    }
+
+    fn can_open_paired_position(
+        state: &ExecutionState,
+        opportunity: &ArbitrageOpportunity,
+        proposed_shares: f64,
+    ) -> Result<()> {
+        if proposed_shares <= 0.0 {
+            return Ok(());
+        }
+
+        if let Some(cap) = max_total_shares_per_market_from_env() {
+            let eth_total = state.total_eth_shares(&opportunity.eth_condition_id) + proposed_shares;
+            let btc_total = state.total_btc_shares(&opportunity.btc_condition_id) + proposed_shares;
+
+            if eth_total > cap || btc_total > cap {
+                return Err(anyhow!(
+                    "paired trade exceeds MAX_TOTAL_SHARES_PER_MARKET: eth_projected={:.2} btc_projected={:.2} cap={:.2}",
+                    eth_total,
+                    btc_total,
+                    cap
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn emergency_unwind(
+        &self,
+        executor: &ExecutorClient,
+        token_id: &str,
+        fallback_bid_price: f64,
+        size_shares: f64,
+        leg_label: &str,
+    ) -> Result<()> {
+        let requested_price = if force_taker_unwind_from_env() {
+            0.01
+        } else {
+            fallback_bid_price
+        };
+        let unwind_price = requested_price.clamp(0.01, 0.99);
+
+        if size_shares <= 0.0 {
+            return Err(anyhow!(
+                "cannot unwind {} leg because size_shares is non-positive: {:.4}",
+                leg_label,
+                size_shares
+            ));
+        }
+
+        match executor
+            .execute_order_with_fok(token_id, Side::Sell, unwind_price, size_shares, true)
+            .await
+        {
+            Ok(resp) => {
+                warn!(
+                    "🧯 Emergency unwind executed (FOK) | leg={} order_id={:?} sell_price={:.4} force_taker={}",
+                    leg_label,
+                    resp.order_id,
+                    unwind_price,
+                    force_taker_unwind_from_env()
+                );
+                Ok(())
+            }
+            Err(fok_err) => {
+                warn!(
+                    "⚠️ Emergency unwind FOK failed for {} leg: {}. Retrying as GTC sell at {:.4}",
+                    leg_label, fok_err, unwind_price
+                );
+
+                let resp = executor
+                    .execute_order_with_fok(token_id, Side::Sell, unwind_price, size_shares, false)
+                    .await
+                    .context(format!(
+                        "failed to emergency unwind {} leg at price {:.4} after FOK failure",
+                        leg_label, unwind_price
+                    ))?;
+
+                warn!(
+                    "🧯 Emergency unwind submitted (GTC fallback) | leg={} order_id={:?} sell_price={:.4}",
+                    leg_label,
+                    resp.order_id,
+                    unwind_price
+                );
+                Ok(())
+            }
+        }
     }
 
     fn rebalance_plan(
@@ -610,23 +707,6 @@ impl Trader {
                 units = max_shares_cap.floor();
                 info!("⚖️ Capped units by MAX_SHARES: units={}", units);
             }
-
-            if strict_share_bounds_from_env() && (max_shares_cap - min_shares).abs() < f64::EPSILON
-            {
-                if units >= max_shares_cap {
-                    units = max_shares_cap;
-                    info!(
-                        "📌 Enforcing exact fixed share count because MIN_SHARES == MAX_SHARES: units={}",
-                        units
-                    );
-                } else {
-                    warn!(
-                        "❌ Trade skipped (strict fixed shares): computed units={:.2}, required exactly {:.2}",
-                        units, max_shares_cap
-                    );
-                    return Ok(());
-                }
-            }
         }
 
         if units < min_shares {
@@ -653,6 +733,25 @@ impl Trader {
             );
         }
 
+        let strict_fixed_shares = strict_share_bounds_from_env()
+            && max_shares_cap
+                .map(|cap| (cap - min_shares).abs() < f64::EPSILON)
+                .unwrap_or(false);
+        if strict_fixed_shares {
+            let fixed_shares = max_shares_cap.unwrap_or(min_shares);
+            if (units - fixed_shares).abs() > f64::EPSILON {
+                warn!(
+                    "❌ Trade skipped (strict fixed shares): computed units={:.2}, required exactly {:.2}",
+                    units, fixed_shares
+                );
+                return Ok(());
+            }
+            info!(
+                "📌 Enforcing exact fixed share count because MIN_SHARES == MAX_SHARES: units={}",
+                units
+            );
+        }
+
         let min_total_spend = Config::min_trade_size();
         if spend < min_total_spend {
             warn!(
@@ -660,6 +759,17 @@ impl Trader {
                 min_total_spend
             );
             return Ok(());
+        }
+
+        if !rebalance_only {
+            let state = self.execution_state.lock().await;
+            if let Err(err) = Self::can_open_paired_position(&state, opportunity, units) {
+                warn!(
+                    "🚫 TRADE SKIP | pair={} reason={}",
+                    opportunity.pair_label, err
+                );
+                return Ok(());
+            }
         }
 
         if let Some(executor) = &self.executor {
@@ -703,6 +813,7 @@ impl Trader {
             let attempts = executor_retry_attempts_from_env();
             let mut eth_resp = None;
             let mut btc_resp = None;
+            let mut one_leg_incident = false;
 
             for attempt in 1..=attempts {
                 info!("🔁 Executor paired attempt {}/{}", attempt, attempts);
@@ -804,73 +915,74 @@ impl Trader {
                         }
 
                         let unwind_price = opportunity.eth_up_bid_price.to_f64().unwrap_or(0.0);
-                        if unwind_price > 0.0 {
-                            match executor
-                                .execute_order(
-                                    &opportunity.eth_up_token_id,
-                                    Side::Sell,
-                                    unwind_price,
-                                    size_shares,
-                                )
-                                .await
-                            {
-                                Ok(resp) => {
-                                    warn!(
-                                        "🧯 Hedged ETH leg immediately after BTC failure (sell order_id={:?})",
-                                        resp.order_id
-                                    );
-                                }
-                                Err(unwind_err) => {
-                                    return Err(anyhow!(
-                                        "second leg failed and immediate ETH unwind failed. second_leg_error: {}; unwind_error: {}",
-                                        e,
-                                        unwind_err
-                                    ));
-                                }
-                            }
-                        }
-
-                        if attempt == attempts {
-                            if executor.allow_partial_arb() {
-                                warn!(
-                                    "⚠️ BTC leg failed in all attempts, but ALLOW_PARTIAL_ARB=true so bot continues after unwind"
-                                );
-                                break;
-                            }
-
+                        if let Err(unwind_err) = self
+                            .emergency_unwind(
+                                executor,
+                                &opportunity.eth_up_token_id,
+                                unwind_price,
+                                size_shares,
+                                "ETH",
+                            )
+                            .await
+                        {
                             return Err(anyhow!(
-                                "second leg failed after {} attempts; first leg was unwound. error: {}",
-                                attempts,
-                                e
+                                "second leg failed and immediate ETH unwind failed. second_leg_error: {}; unwind_error: {}",
+                                e,
+                                unwind_err
                             ));
                         }
+                        eth_resp = None;
+
+                        one_leg_incident = true;
+                        if executor.allow_partial_arb() {
+                            warn!(
+                                "⚠️ BTC leg failed after ETH fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
+                            );
+                            break;
+                        }
+
+                        return Err(anyhow!(
+                            "second leg failed after ETH fill; first leg unwind submitted. error: {}",
+                            e
+                        ));
                     }
-                    (Err(e), Ok(btc_ok)) => {
-                        btc_resp = Some(btc_ok);
+                    (Err(e), Ok(_btc_ok)) => {
                         warn!(
                             "❌ ETH leg failed on paired attempt {}/{}: {}",
                             attempt, attempts, e
                         );
 
                         let unwind_price = opportunity.btc_down_bid_price.to_f64().unwrap_or(0.0);
-                        if unwind_price > 0.0 {
-                            let _ = executor
-                                .execute_order(
-                                    &opportunity.btc_down_token_id,
-                                    Side::Sell,
-                                    unwind_price,
-                                    size_shares,
-                                )
-                                .await;
-                        }
-
-                        if attempt == attempts && !executor.allow_partial_arb() {
+                        if let Err(unwind_err) = self
+                            .emergency_unwind(
+                                executor,
+                                &opportunity.btc_down_token_id,
+                                unwind_price,
+                                size_shares,
+                                "BTC",
+                            )
+                            .await
+                        {
                             return Err(anyhow!(
-                                "first leg failed after {} attempts; second leg was unwound. error: {}",
-                                attempts,
-                                e
+                                "first leg failed and immediate BTC unwind failed. first_leg_error: {}; unwind_error: {}",
+                                e,
+                                unwind_err
                             ));
                         }
+                        btc_resp = None;
+
+                        one_leg_incident = true;
+                        if executor.allow_partial_arb() {
+                            warn!(
+                                "⚠️ ETH leg failed after BTC fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
+                            );
+                            break;
+                        }
+
+                        return Err(anyhow!(
+                            "first leg failed after BTC fill; second leg unwind submitted. error: {}",
+                            e
+                        ));
                     }
                     (Err(eth_err), Err(btc_err)) => {
                         warn!(
@@ -889,7 +1001,11 @@ impl Trader {
                 }
             }
 
-            if eth_resp.is_none() || btc_resp.is_none() {
+            if one_leg_incident {
+                if !executor.allow_partial_arb() {
+                    return Err(anyhow!("paired execution aborted after one-leg incident"));
+                }
+            } else if eth_resp.is_none() || btc_resp.is_none() {
                 if !executor.allow_partial_arb() {
                     return Err(anyhow!(
                         "paired execution did not complete both legs successfully"

@@ -43,7 +43,7 @@ class ExecuteOrderRequest(BaseModel):
     token_id: str
     side: str = Field(pattern="^(BUY|SELL)$")
     price: float = Field(gt=0.0, lt=1.0)
-    size_usdc: float = Field(ge=5.0)
+    size_usdc: float = Field(gt=0.0)
     fok: bool = False
 
 
@@ -53,21 +53,29 @@ class ExecuteOrderResponse(BaseModel):
     error: Optional[str] = None
 
 
-def clamp_order_size(raw_size: float) -> float:
-    size = float(floor(raw_size))
+def clamp_order_size(raw_size: float, side: int) -> float:
+    """Clamp buy size with strict env bounds; keep sell size flexible for emergency exits."""
+    size = float(raw_size)
+
+    if side == SELL:
+        if size <= 0.0:
+            raise ValueError("sell size must be positive")
+        return size
+
+    size = float(floor(size))
 
     if MAX_SHARES is not None:
         if STRICT_SHARE_BOUNDS and abs(MAX_SHARES - MIN_SHARES) < 1e-9:
-            if size < MAX_SHARES:
+            if abs(size - MAX_SHARES) > 1e-9:
                 raise ValueError(
-                    f"strict fixed shares enabled: requested={size:.2f}, required={MAX_SHARES:.2f}"
+                    f"strict fixed shares enabled for BUY: requested={size:.2f}, required exactly={MAX_SHARES:.2f}"
                 )
             return MAX_SHARES
 
         size = min(size, MAX_SHARES)
 
     if size < MIN_SHARES:
-        raise ValueError(f"order size below MIN_SHARES: {size:.2f} < {MIN_SHARES:.2f}")
+        raise ValueError(f"buy size below MIN_SHARES: {size:.2f} < {MIN_SHARES:.2f}")
 
     return size
 
@@ -228,7 +236,7 @@ def health():
 def execute(req: ExecuteOrderRequest):
     try:
         side = BUY if req.side == "BUY" else SELL
-        clamped_size = clamp_order_size(req.size_usdc)
+        clamped_size = clamp_order_size(req.size_usdc, side)
         order_args = build_order_args(
             token_id=req.token_id,
             side=side,
