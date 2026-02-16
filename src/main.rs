@@ -16,6 +16,78 @@ use strategy::ArbitrageDetector;
 use wallet::allowance::verify_allowances;
 use wallet::signer::WalletSigner;
 
+#[derive(Clone, Copy)]
+struct PairConfig {
+    left_name: &'static str,
+    left_prefix: &'static str,
+    right_name: &'static str,
+    right_prefix: &'static str,
+}
+
+fn parse_env_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_bool_any_optional(keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            return Some(parse_env_bool(&value));
+        }
+    }
+    None
+}
+
+fn selected_pair_config() -> Result<PairConfig> {
+    let btc_eth_raw = env_bool_any_optional(&["PAIR_BTC_ETH", "BTC_ETH", "BTC-ETH"]);
+    let btc_sol_raw = env_bool_any_optional(&["PAIR_BTC_SOL", "BTC_SOL", "BTC-SOL"]);
+    let btc_xrp_raw = env_bool_any_optional(&["PAIR_BTC_XRP", "BTC_XRP", "BTC-XRP"]);
+
+    let any_explicit = btc_eth_raw.is_some() || btc_sol_raw.is_some() || btc_xrp_raw.is_some();
+
+    let btc_eth = btc_eth_raw.unwrap_or(!any_explicit);
+    let btc_sol = btc_sol_raw.unwrap_or(false);
+    let btc_xrp = btc_xrp_raw.unwrap_or(false);
+
+    let enabled_count = [btc_eth, btc_sol, btc_xrp]
+        .iter()
+        .filter(|enabled| **enabled)
+        .count();
+
+    if enabled_count != 1 {
+        anyhow::bail!(
+            "exactly one pair toggle must be enabled: PAIR_BTC_ETH, PAIR_BTC_SOL, PAIR_BTC_XRP"
+        );
+    }
+
+    if btc_eth {
+        return Ok(PairConfig {
+            left_name: "BTC",
+            left_prefix: "btc",
+            right_name: "ETH",
+            right_prefix: "eth",
+        });
+    }
+
+    if btc_sol {
+        return Ok(PairConfig {
+            left_name: "BTC",
+            left_prefix: "btc",
+            right_name: "SOL",
+            right_prefix: "sol",
+        });
+    }
+
+    Ok(PairConfig {
+        left_name: "BTC",
+        left_prefix: "btc",
+        right_name: "XRP",
+        right_prefix: "xrp",
+    })
+}
+
 // ===============================
 // TIME HELPERS
 // ===============================
@@ -157,17 +229,23 @@ async fn main() -> Result<()> {
     // MAIN LOOP
     // ===============================
     loop {
-        info!("🔍 Discovering current 15m markets...");
+        let pair_cfg = selected_pair_config()?;
+        info!(
+            "🔍 Discovering current 15m markets for configured pair: {}-{}",
+            pair_cfg.left_name, pair_cfg.right_name
+        );
 
-        let (eth_market, btc_market) = discover_markets(&api).await?;
+        let (left_market, right_market) = discover_markets(&api, pair_cfg).await?;
 
-        info!("✅ ETH Market: {}", eth_market.slug);
-        info!("✅ BTC Market: {}", btc_market.slug);
+        info!("✅ {} Market: {}", pair_cfg.left_name, left_market.slug);
+        info!("✅ {} Market: {}", pair_cfg.right_name, right_market.slug);
 
         let monitor = MarketMonitor::new(
             api.clone(),
-            eth_market,
-            btc_market,
+            left_market,
+            right_market,
+            pair_cfg.left_name.to_string(),
+            pair_cfg.right_name.to_string(),
             config.trading.check_interval_ms,
         );
 
@@ -242,19 +320,36 @@ async fn main() -> Result<()> {
 // ===============================
 // MARKET DISCOVERY (OUTSIDE MAIN)
 // ===============================
-async fn discover_markets(api: &PolymarketClient) -> Result<(domain::Market, domain::Market)> {
+async fn discover_markets(
+    api: &PolymarketClient,
+    pair_cfg: PairConfig,
+) -> Result<(domain::Market, domain::Market)> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
 
     let mut seen = std::collections::HashSet::new();
 
-    let eth = discover_market(api, "ETH", "eth", now, &mut seen).await?;
-    seen.insert(eth.condition_id.clone());
+    let left = discover_market(
+        api,
+        pair_cfg.left_name,
+        pair_cfg.left_prefix,
+        now,
+        &mut seen,
+    )
+    .await?;
+    seen.insert(left.condition_id.clone());
 
-    let btc = discover_market(api, "BTC", "btc", now, &mut seen).await?;
+    let right = discover_market(
+        api,
+        pair_cfg.right_name,
+        pair_cfg.right_prefix,
+        now,
+        &mut seen,
+    )
+    .await?;
 
-    Ok((eth, btc))
+    Ok((left, right))
 }
 
 async fn discover_market(
