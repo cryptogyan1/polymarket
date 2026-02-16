@@ -4,7 +4,6 @@ use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ::rand::Rng;
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use rust_decimal::prelude::ToPrimitive;
