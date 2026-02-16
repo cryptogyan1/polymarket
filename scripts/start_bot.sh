@@ -16,17 +16,16 @@ pids=()
 cleanup() {
   local exit_code=$?
 
-  if [[ ${#pids[@]} -gt 0 ]]; then
-    echo
-    echo "🛑 Stopping all services..."
-    for pid in "${pids[@]}"; do
-      kill "$pid" 2>/dev/null || true
-    done
+  echo
+  echo "🛑 Stopping services..."
 
-    for pid in "${pids[@]}"; do
-      wait "$pid" 2>/dev/null || true
-    done
-  fi
+  for pid in "${pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
 
   exit "$exit_code"
 }
@@ -45,6 +44,6 @@ echo "🦀 Starting Rust bot..."
 cargo run &
 pids+=("$!")
 
-echo "✅ All services started. Press Ctrl+C to stop everything."
+echo "✅ All three processes started. Press Ctrl+C to stop all."
 
 wait -n "${pids[@]}"
