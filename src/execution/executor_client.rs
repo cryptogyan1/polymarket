@@ -87,6 +87,18 @@ impl ExecutorClient {
         price: f64,
         size_usdc: f64,
     ) -> Result<ExecuteOrderResponse> {
+        self.execute_order_with_fok(token_id, side, price, size_usdc, self.fok_enabled)
+            .await
+    }
+
+    pub async fn execute_order_with_fok(
+        &self,
+        token_id: &str,
+        side: Side,
+        price: f64,
+        size_usdc: f64,
+        fok: bool,
+    ) -> Result<ExecuteOrderResponse> {
         let url = format!("{}/execute", self.base_url.trim_end_matches('/'));
         let side = match side {
             Side::Buy => "BUY".to_string(),
@@ -98,7 +110,7 @@ impl ExecutorClient {
             side,
             price,
             size_usdc,
-            fok: self.fok_enabled,
+            fok,
         };
 
         let resp = self
