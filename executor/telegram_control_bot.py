@@ -43,7 +43,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PROXY_WALLET = os.getenv("PROXY_WALLET", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
-TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", os.getenv("RPC_URL", ""))
+TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", "")
 
 
 def _clean_env(name: str) -> str:
@@ -180,18 +180,10 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
 
     if not rpc_url:
         raise RuntimeError(
-            "CLAIM missing RPC URL. Set TELEGRAM_CONTROL_RPC_URL (preferred) or RPC_URL/POLYGON_RPC_URL."
+            "CLAIM missing RPC URL. Set TELEGRAM_CONTROL_RPC_URL (preferred) or POLYGON_RPC_URL."
         )
     if not private_key:
         raise RuntimeError("PRIVATE_KEY is required for CLAIM")
-
-    positions = fetch_open_positions(wallet)
-    settled_conditions = sorted(
-        {p.condition_id for p in positions if p.condition_id and p.resolved}
-    )
-
-    if not settled_conditions:
-        return []
 
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
     try:
@@ -214,6 +206,20 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
         )
 
     acct = w3.eth.account.from_key(private_key)
+
+    # redeemPositions redeems only balances owned by the signing address.
+    lookup_wallet = wallet
+    if wallet and wallet.lower() != acct.address.lower():
+        lookup_wallet = acct.address
+
+    positions = fetch_open_positions(lookup_wallet)
+    settled_conditions = sorted(
+        {p.condition_id for p in positions if p.condition_id and p.resolved}
+    )
+
+    if not settled_conditions:
+        return []
+
     ctf = w3.eth.contract(address=CTF_CONTRACT, abi=CTF_ABI)
 
     tx_hashes: List[str] = []
