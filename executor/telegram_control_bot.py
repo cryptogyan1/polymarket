@@ -52,7 +52,7 @@ def _clean_env(name: str) -> str:
 
 
 def _resolve_rpc_url() -> str:
-    for key in ["TELEGRAM_CONTROL_RPC_URL", "RPC_URL", "POLYGON_RPC_URL"]:
+    for key in ["TELEGRAM_CONTROL_RPC_URL", "POLYGON_RPC_URL"]:
         value = _clean_env(key)
         if value:
             return value
