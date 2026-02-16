@@ -4,3 +4,5 @@ python-dotenv==1.0.1
 pydantic==2.10.4
 py-clob-client==0.34.5
 python-telegram-bot==21.10
+requests==2.32.3
+web3==6.20.2

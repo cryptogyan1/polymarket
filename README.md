@@ -148,6 +148,13 @@ Each candidate must satisfy:
 - one-leg fail-safe unwind in executor mode:
   - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures
 
+- Telegram manual control bot (`executor/telegram_control_bot.py`):
+  - `/start` pins keyboard with buttons: `TRACK`, `KILL`, `CLAIM`
+  - `TRACK` fetches current open positions + held shares from Polymarket data API
+  - `KILL` cashes out all open positions immediately using `PositionGuard`
+  - `CLAIM` submits onchain `redeemPositions` txs for settled positions
+  - uses `TELEGRAM_CONTROL_RPC_URL` (or falls back to `RPC_URL`) for CLAIM tx execution
+
 - optional Telegram notifications in executor mode:
   - set `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`
   - on executor startup, bot sends a "BOT STARTED" Telegram heartbeat
@@ -173,3 +180,15 @@ Each candidate must satisfy:
   - projected combined avg is not worse than current combined avg
   - leg liquidity supports full rebalance size
   - optional exposure cap (`MAX_TOTAL_SHARES_PER_MARKET`) is not exceeded
+
+
+### Telegram manual control bot
+
+```bash
+# from repo root
+python -m executor.telegram_control_bot
+```
+
+Requires env vars: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PROXY_WALLET`, `PRIVATE_KEY`.
+`CLAIM` also requires `TELEGRAM_CONTROL_RPC_URL` (or `RPC_URL`).
+
