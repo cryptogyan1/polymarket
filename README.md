@@ -138,7 +138,7 @@ Each candidate must satisfy:
 
 - one-leg fail-safe unwind in executor mode:
   - if one leg is placed and the other leg fails, bot immediately sends FOK sell on the filled leg
-  - with `FORCE_TAKER_UNWIND=true`, unwind uses a near-zero limit to prioritize immediate exit
+  - with `FORCE_TAKER_UNWIND=true`, unwind uses an aggressive low limit (clamped to 0.01 exchange minimum) to prioritize immediate exit
 
 
 - per-direction trade cap per 15m market window via `MAX_TRADES_PER_DIRECTION_PER_WINDOW`:

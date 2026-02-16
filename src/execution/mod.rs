@@ -338,36 +338,58 @@ impl Trader {
         size_shares: f64,
         leg_label: &str,
     ) -> Result<()> {
-        let taker_price = if force_taker_unwind_from_env() {
-            0.001
+        let requested_price = if force_taker_unwind_from_env() {
+            0.01
         } else {
             fallback_bid_price
         };
+        let unwind_price = requested_price.clamp(0.01, 0.99);
 
-        if taker_price <= 0.0 {
+        if size_shares <= 0.0 {
             return Err(anyhow!(
-                "cannot unwind {} leg because no valid price was available",
-                leg_label
+                "cannot unwind {} leg because size_shares is non-positive: {:.4}",
+                leg_label,
+                size_shares
             ));
         }
 
-        let resp = executor
-            .execute_order_with_fok(token_id, Side::Sell, taker_price, size_shares, true)
+        match executor
+            .execute_order_with_fok(token_id, Side::Sell, unwind_price, size_shares, true)
             .await
-            .context(format!(
-                "failed to emergency unwind {} leg at price {:.4}",
-                leg_label, taker_price
-            ))?;
+        {
+            Ok(resp) => {
+                warn!(
+                    "🧯 Emergency unwind executed (FOK) | leg={} order_id={:?} sell_price={:.4} force_taker={}",
+                    leg_label,
+                    resp.order_id,
+                    unwind_price,
+                    force_taker_unwind_from_env()
+                );
+                Ok(())
+            }
+            Err(fok_err) => {
+                warn!(
+                    "⚠️ Emergency unwind FOK failed for {} leg: {}. Retrying as GTC sell at {:.4}",
+                    leg_label, fok_err, unwind_price
+                );
 
-        warn!(
-            "🧯 Emergency unwind executed | leg={} order_id={:?} sell_price={:.4} force_taker={}",
-            leg_label,
-            resp.order_id,
-            taker_price,
-            force_taker_unwind_from_env()
-        );
+                let resp = executor
+                    .execute_order_with_fok(token_id, Side::Sell, unwind_price, size_shares, false)
+                    .await
+                    .context(format!(
+                        "failed to emergency unwind {} leg at price {:.4} after FOK failure",
+                        leg_label, unwind_price
+                    ))?;
 
-        Ok(())
+                warn!(
+                    "🧯 Emergency unwind submitted (GTC fallback) | leg={} order_id={:?} sell_price={:.4}",
+                    leg_label,
+                    resp.order_id,
+                    unwind_price
+                );
+                Ok(())
+            }
+        }
     }
 
     fn rebalance_plan(
@@ -791,6 +813,7 @@ impl Trader {
             let attempts = executor_retry_attempts_from_env();
             let mut eth_resp = None;
             let mut btc_resp = None;
+            let mut one_leg_incident = false;
 
             for attempt in 1..=attempts {
                 info!("🔁 Executor paired attempt {}/{}", attempt, attempts);
@@ -910,20 +933,18 @@ impl Trader {
                         }
                         eth_resp = None;
 
-                        if attempt == attempts {
-                            if executor.allow_partial_arb() {
-                                warn!(
-                                    "⚠️ BTC leg failed in all attempts, but ALLOW_PARTIAL_ARB=true so bot continues after unwind"
-                                );
-                                break;
-                            }
-
-                            return Err(anyhow!(
-                                "second leg failed after {} attempts; first leg was unwound. error: {}",
-                                attempts,
-                                e
-                            ));
+                        one_leg_incident = true;
+                        if executor.allow_partial_arb() {
+                            warn!(
+                                "⚠️ BTC leg failed after ETH fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
+                            );
+                            break;
                         }
+
+                        return Err(anyhow!(
+                            "second leg failed after ETH fill; first leg unwind submitted. error: {}",
+                            e
+                        ));
                     }
                     (Err(e), Ok(_btc_ok)) => {
                         warn!(
@@ -950,13 +971,18 @@ impl Trader {
                         }
                         btc_resp = None;
 
-                        if attempt == attempts && !executor.allow_partial_arb() {
-                            return Err(anyhow!(
-                                "first leg failed after {} attempts; second leg was unwound. error: {}",
-                                attempts,
-                                e
-                            ));
+                        one_leg_incident = true;
+                        if executor.allow_partial_arb() {
+                            warn!(
+                                "⚠️ ETH leg failed after BTC fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
+                            );
+                            break;
                         }
+
+                        return Err(anyhow!(
+                            "first leg failed after BTC fill; second leg unwind submitted. error: {}",
+                            e
+                        ));
                     }
                     (Err(eth_err), Err(btc_err)) => {
                         warn!(
@@ -975,7 +1001,11 @@ impl Trader {
                 }
             }
 
-            if eth_resp.is_none() || btc_resp.is_none() {
+            if one_leg_incident {
+                if !executor.allow_partial_arb() {
+                    return Err(anyhow!("paired execution aborted after one-leg incident"));
+                }
+            } else if eth_resp.is_none() || btc_resp.is_none() {
                 if !executor.allow_partial_arb() {
                     return Err(anyhow!(
                         "paired execution did not complete both legs successfully"
