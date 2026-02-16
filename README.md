@@ -150,10 +150,12 @@ Each candidate must satisfy:
 
 - Telegram manual control bot (`executor/telegram_control_bot.py`):
   - `/start` pins keyboard with buttons: `TRACK`, `KILL`, `CLAIM`
-  - `TRACK` fetches current open positions + held shares from Polymarket data API
-  - `KILL` cashes out all open positions immediately using `PositionGuard`
+  - all Telegram control actions run in proxy/Safe mode and require `PROXY_WALLET`
+  - `TRACK` fetches current open positions + held shares from Polymarket data API for `PROXY_WALLET`
+  - `KILL` cashes out all open positions immediately using `PositionGuard` for `PROXY_WALLET`
   - `CLAIM` submits onchain `redeemPositions` txs for settled positions
-  - uses `TELEGRAM_CONTROL_RPC_URL` (or falls back to `RPC_URL`) for CLAIM tx execution
+  - if `PROXY_WALLET` is a contract wallet, CLAIM executes via Safe `execTransaction` (threshold=1 supported)
+  - uses `TELEGRAM_CONTROL_RPC_URL` (or falls back to `POLYGON_RPC_URL`) for CLAIM tx execution
 
 - optional Telegram notifications in executor mode:
   - set `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`
@@ -190,7 +192,7 @@ python -m executor.telegram_control_bot
 ```
 
 Requires env vars: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PROXY_WALLET`, `PRIVATE_KEY`.
-`CLAIM` also requires `TELEGRAM_CONTROL_RPC_URL` (or `RPC_URL`).
+`CLAIM` also requires `TELEGRAM_CONTROL_RPC_URL` (or `POLYGON_RPC_URL`).
 
 If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
 - ensure the value is a full HTTPS endpoint (include `https://`),
