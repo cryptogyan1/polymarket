@@ -30,6 +30,21 @@ pub struct ExecuteOrderResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CashoutRequest {
+    pub token_id: String,
+    pub shares: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CashoutResponse {
+    pub ok: bool,
+    pub token_id: String,
+    pub requested_shares: Option<f64>,
+    pub order_id: Option<String>,
+    pub error: Option<String>,
+}
+
 impl ExecutorClient {
     pub fn new(base_url: String) -> Result<Self> {
         let http = Client::builder()
@@ -146,6 +161,55 @@ impl ExecutorClient {
         if !parsed.ok {
             return Err(anyhow!(
                 "executor rejected order intent (status {}): {}",
+                status,
+                parsed.error.unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+
+        Ok(parsed)
+    }
+
+    pub async fn cashout_position(&self, token_id: &str, shares: f64) -> Result<CashoutResponse> {
+        let url = format!("{}/cashout", self.base_url.trim_end_matches('/'));
+
+        let payload = CashoutRequest {
+            token_id: token_id.to_string(),
+            shares: Some(shares),
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send cashout intent to executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor cashout response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor rejected cashout intent (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: CashoutResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for cashout success response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor rejected cashout intent (status {}): {}",
                 status,
                 parsed.error.unwrap_or_else(|| "unknown error".to_string())
             ));

@@ -106,31 +106,36 @@ impl ArbitrageDetector {
         let btc_up = snapshot.btc_market.up_token.as_ref();
         let btc_down = snapshot.btc_market.down_token.as_ref();
 
+        let left_name = snapshot.eth_market.market_name.to_uppercase();
+        let right_name = snapshot.btc_market.market_name.to_uppercase();
+
         // ===============================
-        // PAIR 1: ETH UP + BTC DOWN
+        // PAIR 1: LEFT UP + RIGHT DOWN
         // ===============================
         if let (Some(eth), Some(btc)) = (eth_up, btc_down) {
+            let pair_1_label = format!("{}_UP + {}_DOWN", left_name, right_name);
             if let Some(o) = self.check_pair(
                 eth,
                 btc,
                 &snapshot.eth_market.condition_id,
                 &snapshot.btc_market.condition_id,
-                "ETH_UP + BTC_DOWN",
+                &pair_1_label,
             ) {
                 opportunities.push(o);
             }
         }
 
         // ===============================
-        // PAIR 2: ETH DOWN + BTC UP
+        // PAIR 2: LEFT DOWN + RIGHT UP
         // ===============================
         if let (Some(eth), Some(btc)) = (eth_down, btc_up) {
+            let pair_2_label = format!("{}_DOWN + {}_UP", left_name, right_name);
             if let Some(o) = self.check_pair(
                 eth,
                 btc,
                 &snapshot.eth_market.condition_id,
                 &snapshot.btc_market.condition_id,
-                "ETH_DOWN + BTC_UP",
+                &pair_2_label,
             ) {
                 opportunities.push(o);
             }

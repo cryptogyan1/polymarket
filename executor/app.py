@@ -1,12 +1,22 @@
+import asyncio
 import os
+import threading
 import re
 import traceback
 from math import floor
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+from executor.position_guard import PositionGuard
+from executor.telegram_notifier import (
+    TelegramNotifier,
+    TradeResult,
+    UnwindInfo,
+    leg_info_from_dict,
+)
 
 try:
     from eth_account import Account
@@ -51,6 +61,30 @@ class ExecuteOrderResponse(BaseModel):
     ok: bool
     order_id: Optional[str] = None
     error: Optional[str] = None
+
+
+class CashoutRequest(BaseModel):
+    token_id: str
+    shares: Optional[float] = Field(default=None, gt=0.0)
+
+
+class CashoutResponse(BaseModel):
+    ok: bool
+    token_id: str
+    requested_shares: Optional[float] = None
+    order_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class TelegramNotificationRequest(BaseModel):
+    type: str
+    data: Dict[str, Any]
+
+
+class TelegramNotificationResponse(BaseModel):
+    ok: bool
+    error: Optional[str] = None
+    message_id: Optional[int] = None
 
 
 def clamp_order_size(raw_size: float, side: int) -> float:
@@ -225,6 +259,69 @@ def init_client() -> ClobClient:
 
 
 CLIENT = init_client()
+GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "true"
+
+if TELEGRAM_ENABLED:
+    try:
+        NOTIFIER = TelegramNotifier()
+        print("[executor] Telegram notifications enabled")
+    except Exception as exc:
+        print(f"[executor] failed to initialize Telegram notifier: {exc}")
+        NOTIFIER = None
+else:
+    NOTIFIER = None
+
+
+
+
+def _env_bool_any(keys, default: Optional[bool] = None) -> Optional[bool]:
+    for key in keys:
+        raw = os.getenv(key)
+        if raw is not None:
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def configured_pair_name() -> str:
+    btc_eth_raw = _env_bool_any(["PAIR_BTC_ETH", "BTC_ETH", "BTC-ETH"], None)
+    btc_sol_raw = _env_bool_any(["PAIR_BTC_SOL", "BTC_SOL", "BTC-SOL"], None)
+    btc_xrp_raw = _env_bool_any(["PAIR_BTC_XRP", "BTC_XRP", "BTC-XRP"], None)
+
+    any_explicit = any(v is not None for v in [btc_eth_raw, btc_sol_raw, btc_xrp_raw])
+    btc_eth = btc_eth_raw if btc_eth_raw is not None else (not any_explicit)
+    btc_sol = btc_sol_raw or False
+    btc_xrp = btc_xrp_raw or False
+
+    if btc_sol and not btc_eth and not btc_xrp:
+        return "BTC-SOL"
+    if btc_xrp and not btc_eth and not btc_sol:
+        return "BTC-XRP"
+    return "BTC-ETH"
+
+
+def send_telegram_notification(coro) -> None:
+    if NOTIFIER is None:
+        return
+
+    def _runner():
+        try:
+            asyncio.run(coro)
+        except Exception as exc:
+            print(f"[executor] telegram notification failed: {exc}")
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+@app.on_event("startup")
+async def startup_event():
+    if NOTIFIER is None:
+        return
+
+    try:
+        await NOTIFIER.send_startup_notification("polymarket-executor")
+    except Exception as exc:
+        print(f"[executor] failed to send startup telegram notification: {exc}")
 
 
 @app.get("/health")
@@ -278,3 +375,119 @@ def execute(req: ExecuteOrderRequest):
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/cashout", response_model=CashoutResponse)
+def cashout(req: CashoutRequest):
+    """Unwind position using GTC market order (no $1 minimum)."""
+    unwind_info = UnwindInfo(
+        timestamp=TelegramNotifier.format_timestamp(),
+        token=req.token_id,
+        shares_to_sell=float(req.shares or 0.0),
+        original_cost=0.0,
+        original_direction=configured_pair_name(),
+    )
+    if NOTIFIER:
+        send_telegram_notification(NOTIFIER.send_unwind_initiated(unwind_info))
+
+    try:
+        result = GUARD.cashout_market(
+            token_id=req.token_id,
+            shares=req.shares,
+            max_retries=3,
+            retry_delay_ms=300,
+        )
+
+        if result.ok and NOTIFIER:
+            unwind_info.order_id = result.order_id
+            unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
+            unwind_info.status = "completed"
+            send_telegram_notification(NOTIFIER.update_unwind_complete(unwind_info))
+        elif NOTIFIER and not result.ok:
+            unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
+            unwind_info.status = "failed"
+            send_telegram_notification(
+                NOTIFIER.send_unwind_failed(unwind_info, result.error or "unknown unwind error")
+            )
+
+        return CashoutResponse(
+            ok=result.ok,
+            token_id=result.token_id,
+            requested_shares=result.requested_shares,
+            order_id=result.order_id,
+            error=result.error,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        if NOTIFIER:
+            send_telegram_notification(NOTIFIER.send_unwind_failed(unwind_info, str(exc)))
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/notify", response_model=TelegramNotificationResponse)
+def notify(req: TelegramNotificationRequest):
+    """Forward structured notifications (from Rust or other services) to Telegram."""
+    if NOTIFIER is None:
+        return TelegramNotificationResponse(ok=False, error="telegram_notifier_disabled")
+
+    try:
+        if req.type == "success":
+            trade = TradeResult(
+                timestamp=str(req.data.get("timestamp", TelegramNotifier.format_timestamp())),
+                direction=str(req.data.get("direction", "")),
+                leg1=leg_info_from_dict(req.data.get("leg1", {})),
+                leg2=leg_info_from_dict(req.data.get("leg2", {})),
+                total_cost=float(req.data.get("total_cost", 0.0)),
+                combined_price=float(req.data.get("combined_price", 0.0)),
+                target_price=float(req.data.get("target_price", 0.0)),
+                profit_potential=req.data.get("profit_potential"),
+                execution_time_seconds=req.data.get("execution_time_seconds"),
+            )
+            send_telegram_notification(NOTIFIER.send_both_legs_filled(trade))
+            return TelegramNotificationResponse(ok=True)
+
+        if req.type == "partial":
+            trade = TradeResult(
+                timestamp=str(req.data.get("timestamp", TelegramNotifier.format_timestamp())),
+                direction=str(req.data.get("direction", "")),
+                leg1=leg_info_from_dict(req.data.get("leg1", {})),
+                leg2=leg_info_from_dict(req.data.get("leg2", {})),
+                total_cost=float(req.data.get("total_cost", 0.0)),
+                combined_price=float(req.data.get("combined_price", 0.0)),
+                target_price=float(req.data.get("target_price", 0.0)),
+                profit_potential=req.data.get("profit_potential"),
+                execution_time_seconds=req.data.get("execution_time_seconds"),
+            )
+            send_telegram_notification(NOTIFIER.send_one_leg_alert(trade))
+            return TelegramNotificationResponse(ok=True)
+
+        if req.type == "unwind_start":
+            unwind = UnwindInfo(
+                timestamp=str(req.data.get("timestamp", TelegramNotifier.format_timestamp())),
+                token=str(req.data.get("token", "")),
+                shares_to_sell=float(req.data.get("shares_to_sell", 0.0)),
+                original_cost=float(req.data.get("original_cost", 0.0)),
+                original_direction=str(req.data.get("original_direction", "")),
+                failed_leg=str(req.data.get("failed_leg", "")),
+            )
+            send_telegram_notification(NOTIFIER.send_unwind_initiated(unwind))
+            return TelegramNotificationResponse(ok=True)
+
+        if req.type == "unwind_complete":
+            unwind = UnwindInfo(
+                timestamp=str(req.data.get("timestamp", TelegramNotifier.format_timestamp())),
+                token=str(req.data.get("token", "")),
+                shares_to_sell=float(req.data.get("shares_to_sell", 0.0)),
+                original_cost=float(req.data.get("original_cost", 0.0)),
+                market_price=req.data.get("market_price"),
+                received_usdc=req.data.get("received_usdc"),
+                order_id=req.data.get("order_id"),
+                status="completed",
+            )
+            send_telegram_notification(NOTIFIER.update_unwind_complete(unwind))
+            return TelegramNotificationResponse(ok=True)
+
+        return TelegramNotificationResponse(ok=False, error=f"unknown_notification_type:{req.type}")
+    except Exception as exc:
+        traceback.print_exc()
+        return TelegramNotificationResponse(ok=False, error=str(exc))

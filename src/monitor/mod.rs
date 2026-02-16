@@ -11,8 +11,10 @@ use tokio::try_join;
 
 pub struct MarketMonitor {
     api: Arc<PolymarketClient>,
-    eth_market: Market,
-    btc_market: Market,
+    left_market: Market,
+    right_market: Market,
+    left_name: String,
+    right_name: String,
     check_interval: Duration,
 }
 
@@ -26,14 +28,18 @@ pub struct MarketSnapshot {
 impl MarketMonitor {
     pub fn new(
         api: Arc<PolymarketClient>,
-        eth_market: Market,
-        btc_market: Market,
+        left_market: Market,
+        right_market: Market,
+        left_name: String,
+        right_name: String,
         check_interval_ms: u64,
     ) -> Self {
         Self {
             api,
-            eth_market,
-            btc_market,
+            left_market,
+            right_market,
+            left_name,
+            right_name,
             check_interval: Duration::from_millis(check_interval_ms),
         }
     }
@@ -57,8 +63,8 @@ impl MarketMonitor {
 
     async fn fetch_snapshot(&self) -> Result<MarketSnapshot> {
         let (eth_market, btc_market) = try_join!(
-            self.build_market("ETH", &self.eth_market),
-            self.build_market("BTC", &self.btc_market),
+            self.build_market(&self.left_name, &self.left_market),
+            self.build_market(&self.right_name, &self.right_market),
         )?;
 
         Ok(MarketSnapshot {
