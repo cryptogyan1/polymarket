@@ -838,6 +838,25 @@ impl Trader {
                     (Ok(eth_ok), Ok(btc_ok)) => {
                         info!("✅ ETH leg submitted via executor: {:?}", eth_ok.order_id);
                         info!("✅ BTC leg submitted via executor: {:?}", btc_ok.order_id);
+
+                        if let Err(notify_err) = executor
+                            .notify_trade_success(
+                                &opportunity.pair_label,
+                                &opportunity.eth_up_token_id,
+                                opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                eth_ok.order_id.as_deref(),
+                                &opportunity.btc_down_token_id,
+                                opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                btc_ok.order_id.as_deref(),
+                                spend,
+                                combined,
+                                target,
+                            )
+                            .await
+                        {
+                            warn!("⚠️ failed to send executor trade notification: {}", notify_err);
+                        }
+
                         eth_resp = Some(eth_ok);
                         btc_resp = Some(btc_ok);
                         break;
