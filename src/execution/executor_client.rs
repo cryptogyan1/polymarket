@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::domain::order::Side;
@@ -14,6 +14,18 @@ pub struct ExecutorClient {
     allow_partial_arb: bool,
 }
 
+
+#[derive(Debug, Serialize)]
+pub struct TelegramNotifyRequest {
+    pub r#type: String,
+    pub data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramNotifyResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
 #[derive(Debug, Serialize)]
 pub struct ExecuteOrderRequest {
     pub token_id: String,
@@ -167,6 +179,88 @@ impl ExecutorClient {
         }
 
         Ok(parsed)
+    }
+
+
+    pub async fn notify_trade_success(
+        &self,
+        direction: &str,
+        leg1_token: &str,
+        leg1_price: f64,
+        leg1_order_id: Option<&str>,
+        leg2_token: &str,
+        leg2_price: f64,
+        leg2_order_id: Option<&str>,
+        total_cost: f64,
+        combined_price: f64,
+        target_price: f64,
+    ) -> Result<()> {
+        let payload = TelegramNotifyRequest {
+            r#type: "success".to_string(),
+            data: json!({
+                "direction": direction,
+                "leg1": {
+                    "token": leg1_token,
+                    "price": leg1_price,
+                    "filled": true,
+                    "order_id": leg1_order_id,
+                },
+                "leg2": {
+                    "token": leg2_token,
+                    "price": leg2_price,
+                    "filled": true,
+                    "order_id": leg2_order_id,
+                },
+                "total_cost": total_cost,
+                "combined_price": combined_price,
+                "target_price": target_price,
+            }),
+        };
+
+        self.notify(&payload).await
+    }
+
+    async fn notify(&self, payload: &TelegramNotifyRequest) -> Result<()> {
+        let url = format!("{}/notify", self.base_url.trim_end_matches('/'));
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(payload)
+            .send()
+            .await
+            .context("failed to send telegram notification to executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor notify response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor notify endpoint failed (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: TelegramNotifyResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for notify success response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor notify endpoint rejected payload: {}",
+                parsed.error.unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+
+        Ok(())
     }
 
     pub async fn cashout_position(&self, token_id: &str, shares: f64) -> Result<CashoutResponse> {
