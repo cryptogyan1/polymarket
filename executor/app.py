@@ -286,6 +286,17 @@ def send_telegram_notification(coro) -> None:
     threading.Thread(target=_runner, daemon=True).start()
 
 
+@app.on_event("startup")
+async def startup_event():
+    if NOTIFIER is None:
+        return
+
+    try:
+        await NOTIFIER.send_startup_notification("polymarket-executor")
+    except Exception as exc:
+        print(f"[executor] failed to send startup telegram notification: {exc}")
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "mode": "execution-only"}

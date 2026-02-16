@@ -63,6 +63,22 @@ class TelegramNotifier:
         self.bot = Bot(token=self.bot_token)
         self._unwind_message_ids: Dict[str, int] = {}
 
+
+    async def send_startup_notification(self, service_name: str = "polymarket-executor") -> None:
+        """Send a startup heartbeat message so operators know bot is live."""
+        message = f"""🟢 <b>BOT STARTED</b>
+
+Service: <b>{service_name}</b>
+Time: {self.format_timestamp()}
+Status: Running and ready to send trade/unwind alerts.
+"""
+        await self.bot.send_message(
+            chat_id=self.chat_id,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            disable_notification=False,
+        )
+
     async def send_both_legs_filled(self, trade: TradeResult) -> None:
         profit_value = trade.profit_potential or 0.0
         profit_pct = (profit_value / trade.total_cost * 100.0) if trade.total_cost > 0 else 0.0

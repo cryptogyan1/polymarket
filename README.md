@@ -140,6 +140,7 @@ Each candidate must satisfy:
 
 - optional Telegram notifications in executor mode:
   - set `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`
+  - on executor startup, bot sends a "BOT STARTED" Telegram heartbeat
   - `/cashout` sends unwind initiated/completed/failed alerts
   - `/notify` endpoint accepts structured events (`success`, `partial`, `unwind_start`, `unwind_complete`) so Rust can push trade notifications
 
