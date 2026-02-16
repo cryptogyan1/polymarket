@@ -12,7 +12,7 @@ try:
     from eth_account import Account
     from eth_utils import is_address, to_checksum_address
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY, SELL
 except Exception as exc:
     raise RuntimeError(
@@ -51,6 +51,11 @@ class ExecuteOrderResponse(BaseModel):
     ok: bool
     order_id: Optional[str] = None
     error: Optional[str] = None
+
+
+class CashoutRequest(BaseModel):
+    token_id: str
+    size_usdc: float = Field(gt=0.0)
 
 
 def clamp_order_size(raw_size: float, side: int) -> float:
@@ -269,6 +274,31 @@ def execute(req: ExecuteOrderRequest):
             )
             signed = CLIENT.create_order(retry_args)
             result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
+
+        order_id = None
+        if isinstance(result, dict):
+            order_id = result.get("orderID") or result.get("order_id")
+
+        return ExecuteOrderResponse(ok=True, order_id=order_id)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/cashout", response_model=ExecuteOrderResponse)
+def cashout(req: CashoutRequest):
+    try:
+        clamped_size = clamp_order_size(req.size_usdc, SELL)
+        order_args = MarketOrderArgs(
+            token_id=req.token_id,
+            amount=clamped_size,
+            side=SELL,
+            fee_rate_bps=resolve_fee_rate_bps() or 0,
+            order_type=OrderType.FOK,
+        )
+
+        signed = CLIENT.create_market_order(order_args)
+        result = CLIENT.post_order(signed, OrderType.FOK)
 
         order_id = None
         if isinstance(result, dict):

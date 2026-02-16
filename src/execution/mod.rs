@@ -39,7 +39,6 @@ struct ExecutionEnv {
     trade_fee_bps: f64,
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
-    force_taker_unwind: bool,
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -97,10 +96,6 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0),
-        force_taker_unwind: std::env::var("FORCE_TAKER_UNWIND")
-            .unwrap_or_else(|_| "true".to_string())
-            .trim()
-            .eq_ignore_ascii_case("true"),
     }
 }
 
@@ -155,10 +150,6 @@ fn slippage_bps_from_env() -> f64 {
 
 fn max_total_shares_per_market_from_env() -> Option<f64> {
     env_settings().max_total_shares_per_market
-}
-
-fn force_taker_unwind_from_env() -> bool {
-    env_settings().force_taker_unwind
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -334,17 +325,10 @@ impl Trader {
         &self,
         executor: &ExecutorClient,
         token_id: &str,
-        fallback_bid_price: f64,
+        _fallback_bid_price: f64,
         size_shares: f64,
         leg_label: &str,
     ) -> Result<()> {
-        let requested_price = if force_taker_unwind_from_env() {
-            0.01
-        } else {
-            fallback_bid_price
-        };
-        let unwind_price = requested_price.clamp(0.01, 0.99);
-
         if size_shares <= 0.0 {
             return Err(anyhow!(
                 "cannot unwind {} leg because size_shares is non-positive: {:.4}",
@@ -353,43 +337,17 @@ impl Trader {
             ));
         }
 
-        match executor
-            .execute_order_with_fok(token_id, Side::Sell, unwind_price, size_shares, true)
+        let resp = executor
+            .cashout_position(token_id, size_shares)
             .await
-        {
-            Ok(resp) => {
-                warn!(
-                    "🧯 Emergency unwind executed (FOK) | leg={} order_id={:?} sell_price={:.4} force_taker={}",
-                    leg_label,
-                    resp.order_id,
-                    unwind_price,
-                    force_taker_unwind_from_env()
-                );
-                Ok(())
-            }
-            Err(fok_err) => {
-                warn!(
-                    "⚠️ Emergency unwind FOK failed for {} leg: {}. Retrying as GTC sell at {:.4}",
-                    leg_label, fok_err, unwind_price
-                );
+            .with_context(|| format!("failed to cashout {} leg", leg_label))?;
 
-                let resp = executor
-                    .execute_order_with_fok(token_id, Side::Sell, unwind_price, size_shares, false)
-                    .await
-                    .context(format!(
-                        "failed to emergency unwind {} leg at price {:.4} after FOK failure",
-                        leg_label, unwind_price
-                    ))?;
+        warn!(
+            "🧯 Emergency unwind executed via cashout | leg={} order_id={:?} size={:.4}",
+            leg_label, resp.order_id, size_shares
+        );
 
-                warn!(
-                    "🧯 Emergency unwind submitted (GTC fallback) | leg={} order_id={:?} sell_price={:.4}",
-                    leg_label,
-                    resp.order_id,
-                    unwind_price
-                );
-                Ok(())
-            }
-        }
+        Ok(())
     }
 
     fn rebalance_plan(
