@@ -839,6 +839,10 @@ impl Trader {
                         info!("✅ ETH leg submitted via executor: {:?}", eth_ok.order_id);
                         info!("✅ BTC leg submitted via executor: {:?}", btc_ok.order_id);
 
+                        let combined_price = opportunity.total_cost.to_f64().unwrap_or_default();
+                        let target_price =
+                            arbitrage_max_sum_from_env() + arbitrage_sum_tolerance_from_env();
+
                         if let Err(notify_err) = executor
                             .notify_trade_success(
                                 &opportunity.pair_label,
@@ -849,12 +853,15 @@ impl Trader {
                                 opportunity.btc_down_price.to_f64().unwrap_or_default(),
                                 btc_ok.order_id.as_deref(),
                                 spend,
-                                combined,
-                                target,
+                                combined_price,
+                                target_price,
                             )
                             .await
                         {
-                            warn!("⚠️ failed to send executor trade notification: {}", notify_err);
+                            warn!(
+                                "⚠️ failed to send executor trade notification: {}",
+                                notify_err
+                            );
                         }
 
                         eth_resp = Some(eth_ok);

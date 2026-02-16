@@ -64,6 +64,12 @@ uvicorn executor.app:app --host 127.0.0.1 --port 8787
 cargo run
 ```
 
+Or run the telegram control bot with one command (includes venv activation):
+
+```bash
+bash scripts/start_bot.sh
+```
+
 ## Modes
 
 - `EXECUTION_MODE=executor` (**recommended**): Rust sends order intents to local Python executor.

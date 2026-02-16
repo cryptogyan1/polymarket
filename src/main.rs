@@ -104,10 +104,7 @@ fn current_15m_period() -> u64 {
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
+    logging::init_logging()?;
 
     info!("🚀 Starting Polymarket Arbitrage Bot");
 
