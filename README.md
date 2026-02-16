@@ -150,10 +150,11 @@ Each candidate must satisfy:
 
 - Telegram manual control bot (`executor/telegram_control_bot.py`):
   - `/start` pins keyboard with buttons: `TRACK`, `KILL`, `CLAIM`
-  - `TRACK` fetches current open positions + held shares from Polymarket data API
-  - `KILL` cashes out all open positions immediately using `PositionGuard`
+  - all Telegram control actions run in proxy/Safe mode and require `PROXY_WALLET`
+  - `TRACK` fetches current open positions + held shares from Polymarket data API for `PROXY_WALLET`
+  - `KILL` cashes out all open positions immediately using `PositionGuard` for `PROXY_WALLET`
   - `CLAIM` submits onchain `redeemPositions` txs for settled positions
-  - CLAIM checks settled positions for the signer wallet derived from `PRIVATE_KEY` (redeem is signer-owned onchain)
+  - if `PROXY_WALLET` is a contract wallet, CLAIM executes via Safe `execTransaction` (threshold=1 supported)
   - uses `TELEGRAM_CONTROL_RPC_URL` (or falls back to `POLYGON_RPC_URL`) for CLAIM tx execution
 
 - optional Telegram notifications in executor mode:
