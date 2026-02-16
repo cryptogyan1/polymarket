@@ -29,6 +29,10 @@ EXECUTOR_URL=http://127.0.0.1:8787
 POLY_SIGNATURE_TYPE=2
 # optional: Fill-Or-Kill execution in executor mode
 FOK=false
+# pair selection (enable exactly one)
+PAIR_BTC_ETH=true
+PAIR_BTC_SOL=false
+PAIR_BTC_XRP=false
 # optional: per market-window cap, per direction (0 = unlimited)
 MAX_TRADES_PER_DIRECTION_PER_WINDOW=2
 # optional: max share exposure per market condition (0/unset = unlimited)
@@ -121,7 +125,6 @@ ARBITRAGE_MAX_SUM=0.985
 MIN_SHARES=5
 MAX_SHARES=25
 STRICT_SHARE_BOUNDS=true
-FORCE_TAKER_UNWIND=true
 
 
 Strategy pair logic (only these two combinations are considered):
@@ -136,9 +139,20 @@ Each candidate must satisfy:
 - strict fixed share mode is enforced when `STRICT_SHARE_BOUNDS=true` and `MIN_SHARES == MAX_SHARES`:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
 
+- pair toggles in env (enable exactly one):
+  - `PAIR_BTC_ETH=true` trades BTC/ETH 15m pair
+  - `PAIR_BTC_SOL=true` trades BTC/SOL 15m pair
+  - `PAIR_BTC_XRP=true` trades BTC/XRP 15m pair
+  - bot rejects startup if none or multiple toggles are enabled
+
 - one-leg fail-safe unwind in executor mode:
-  - if one leg is placed and the other leg fails, bot immediately sends FOK sell on the filled leg
-  - with `FORCE_TAKER_UNWIND=true`, unwind uses an aggressive low limit (clamped to 0.01 exchange minimum) to prioritize immediate exit
+  - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures
+
+- optional Telegram notifications in executor mode:
+  - set `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`
+  - on executor startup, bot sends a "BOT STARTED" Telegram heartbeat
+  - `/cashout` sends unwind initiated/completed/failed alerts
+  - `/notify` endpoint accepts structured events (`success`, `partial`, `unwind_start`, `unwind_complete`) so Rust can push trade notifications
 
 
 - per-direction trade cap per 15m market window via `MAX_TRADES_PER_DIRECTION_PER_WINDOW`:
