@@ -1,0 +1,2 @@
+[2026-02-16T12:39:35Z INFO polymarket_15m_arbitrage_bot::strategy] ❌ Rejected: Effective total cost $1.0135 > max_allowed $0.9700 (raw_total=$0.9999)
+[2026-02-16T12:39:36Z INFO polymarket_15m_arbitrage_bot::strategy] ❌ Rejected: Effective total cost $1.0236 > max_allowed $0.9700 (raw_total=$1.0099)

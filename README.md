@@ -64,6 +64,12 @@ uvicorn executor.app:app --host 127.0.0.1 --port 8787
 cargo run
 ```
 
+Or run all services together (executor API + telegram control bot + Rust bot) and stop all with `Ctrl+C`:
+
+```bash
+bash scripts/start_bot.sh
+```
+
 ## Modes
 
 - `EXECUTION_MODE=executor` (**recommended**): Rust sends order intents to local Python executor.
