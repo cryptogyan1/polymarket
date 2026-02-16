@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from executor.position_guard import PositionGuard
+
 try:
     from eth_account import Account
     from eth_utils import is_address, to_checksum_address
@@ -49,6 +51,19 @@ class ExecuteOrderRequest(BaseModel):
 
 class ExecuteOrderResponse(BaseModel):
     ok: bool
+    order_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CashoutRequest(BaseModel):
+    token_id: str
+    shares: Optional[float] = Field(default=None, gt=0.0)
+
+
+class CashoutResponse(BaseModel):
+    ok: bool
+    token_id: str
+    requested_shares: Optional[float] = None
     order_id: Optional[str] = None
     error: Optional[str] = None
 
@@ -225,6 +240,7 @@ def init_client() -> ClobClient:
 
 
 CLIENT = init_client()
+GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
 
 
 @app.get("/health")
@@ -275,6 +291,28 @@ def execute(req: ExecuteOrderRequest):
             order_id = result.get("orderID") or result.get("order_id")
 
         return ExecuteOrderResponse(ok=True, order_id=order_id)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/cashout", response_model=CashoutResponse)
+def cashout(req: CashoutRequest):
+    """Unwind position using GTC market order (no $1 minimum)."""
+    try:
+        result = GUARD.cashout_market(
+            token_id=req.token_id,
+            shares=req.shares,
+            max_retries=3,
+            retry_delay_ms=300,
+        )
+        return CashoutResponse(
+            ok=result.ok,
+            token_id=result.token_id,
+            requested_shares=result.requested_shares,
+            order_id=result.order_id,
+            error=result.error,
+        )
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc))

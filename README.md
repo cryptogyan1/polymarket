@@ -121,7 +121,6 @@ ARBITRAGE_MAX_SUM=0.985
 MIN_SHARES=5
 MAX_SHARES=25
 STRICT_SHARE_BOUNDS=true
-FORCE_TAKER_UNWIND=true
 
 
 Strategy pair logic (only these two combinations are considered):
@@ -137,8 +136,7 @@ Each candidate must satisfy:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
 
 - one-leg fail-safe unwind in executor mode:
-  - if one leg is placed and the other leg fails, bot immediately sends FOK sell on the filled leg
-  - with `FORCE_TAKER_UNWIND=true`, unwind uses an aggressive low limit (clamped to 0.01 exchange minimum) to prioritize immediate exit
+  - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures
 
 
 - per-direction trade cap per 15m market window via `MAX_TRADES_PER_DIRECTION_PER_WINDOW`:
