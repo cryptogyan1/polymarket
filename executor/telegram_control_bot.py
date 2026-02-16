@@ -45,6 +45,33 @@ PROXY_WALLET = os.getenv("PROXY_WALLET", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", os.getenv("RPC_URL", ""))
 
+
+def _clean_env(name: str) -> str:
+    raw = os.getenv(name, "")
+    return raw.strip().strip('"').strip("'")
+
+
+def _resolve_rpc_url() -> str:
+    for key in ["TELEGRAM_CONTROL_RPC_URL", "POLYGON_RPC_URL"]:
+        value = _clean_env(key)
+        if value:
+            return value
+    return ""
+
+
+def _safe_rpc_label(url: str) -> str:
+    if not url:
+        return "<empty>"
+    no_query = url.split("?", 1)[0]
+    if "://" not in no_query:
+        return no_query
+    scheme, rest = no_query.split("://", 1)
+    if "/" in rest:
+        host, _ = rest.split("/", 1)
+    else:
+        host = rest
+    return f"{scheme}://{host}"
+
 CTF_CONTRACT = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
@@ -148,8 +175,13 @@ def fetch_open_positions(wallet: str) -> List[PositionRow]:
 
 
 def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List[str]:
+    rpc_url = rpc_url.strip().strip('"').strip("'")
+    private_key = private_key.strip().strip('"').strip("'")
+
     if not rpc_url:
-        raise RuntimeError("TELEGRAM_CONTROL_RPC_URL (or RPC_URL) is required for CLAIM")
+        raise RuntimeError(
+            "CLAIM missing RPC URL. Set TELEGRAM_CONTROL_RPC_URL (preferred) or RPC_URL/POLYGON_RPC_URL."
+        )
     if not private_key:
         raise RuntimeError("PRIVATE_KEY is required for CLAIM")
 
@@ -161,9 +193,25 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
     if not settled_conditions:
         return []
 
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
-    if not w3.is_connected():
-        raise RuntimeError("failed connecting to TELEGRAM_CONTROL_RPC_URL")
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
+    try:
+        connected = w3.is_connected()
+        chain_id = w3.eth.chain_id if connected else None
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed connecting to RPC ({_safe_rpc_label(rpc_url)}): {exc}"
+        ) from exc
+
+    if not connected:
+        raise RuntimeError(
+            f"failed connecting to RPC ({_safe_rpc_label(rpc_url)}). "
+            "Check protocol (https://), API key, and outbound network access."
+        )
+
+    if chain_id != 137:
+        raise RuntimeError(
+            f"RPC chain mismatch for CLAIM: expected Polygon mainnet (137), got {chain_id}."
+        )
 
     acct = w3.eth.account.from_key(private_key)
     ctf = w3.eth.contract(address=CTF_CONTRACT, abi=CTF_ABI)
@@ -331,14 +379,16 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Unauthorized chat")
         return
 
-    wallet = PROXY_WALLET or CLIENT.get_address()
+    wallet = (_clean_env("PROXY_WALLET") or PROXY_WALLET) or CLIENT.get_address()
+    rpc_url = _resolve_rpc_url() or TELEGRAM_CONTROL_RPC_URL
+    private_key = _clean_env("PRIVATE_KEY") or PRIVATE_KEY
 
     try:
         tx_hashes = await asyncio.to_thread(
             claim_settled_positions,
             wallet,
-            TELEGRAM_CONTROL_RPC_URL,
-            PRIVATE_KEY,
+            rpc_url,
+            private_key,
         )
 
         if not tx_hashes:

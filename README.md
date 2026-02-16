@@ -192,3 +192,9 @@ python -m executor.telegram_control_bot
 Requires env vars: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PROXY_WALLET`, `PRIVATE_KEY`.
 `CLAIM` also requires `TELEGRAM_CONTROL_RPC_URL` (or `RPC_URL`).
 
+If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
+- ensure the value is a full HTTPS endpoint (include `https://`),
+- avoid surrounding quotes/spaces in env values,
+- verify it is Polygon mainnet (`chainId=137`),
+- optionally set `POLYGON_RPC_URL` as an additional fallback.
+
