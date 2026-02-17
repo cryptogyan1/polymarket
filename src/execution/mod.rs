@@ -2,14 +2,13 @@ pub mod clob_client;
 pub mod errors;
 pub mod executor_client;
 pub mod orderbook;
-pub mod trader;
 
 use crate::client::PolymarketClient;
-use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConfig};
+use crate::config::{PositionSizing, TradeMode, TradingConfig, WalletConfig};
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
@@ -40,7 +39,6 @@ struct ExecutionEnv {
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
     imbalance_trim_settle_ms: u64,
-    imbalance_trim_settle_ms_retry: u64,
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -102,10 +100,6 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(800),
-        imbalance_trim_settle_ms_retry: std::env::var("IMBALANCE_TRIM_SETTLE_MS_RETRY")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(300),
     }
 }
 
@@ -166,10 +160,6 @@ fn imbalance_trim_settle_ms_from_env() -> u64 {
     env_settings().imbalance_trim_settle_ms
 }
 
-fn imbalance_trim_settle_ms_retry_from_env() -> u64 {
-    env_settings().imbalance_trim_settle_ms_retry
-}
-
 fn str_to_h256(s: &str) -> H256 {
     H256::from_slice(&keccak256(s.as_bytes()))
 }
@@ -208,17 +198,63 @@ fn fmt_count(limit: usize, count: usize) -> String {
     }
 }
 
+/// Maximum number of detection cycles to hold an orphaned leg before force-cashing out.
+/// Each cycle is roughly CHECK_INTERVAL_MS. Default = 4 cycles (~60s at 15s interval).
+fn orphaned_leg_max_cycles() -> u32 {
+    std::env::var("ORPHANED_LEG_MAX_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Stop-loss: if the orphaned leg's current best_bid drops more than this fraction
+/// below the entry price, abandon and cashout. Default = 0.20 (20%).
+fn orphaned_leg_stop_loss_pct() -> f64 {
+    std::env::var("ORPHANED_LEG_STOP_LOSS_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.20)
+}
+
+/// A filled leg whose counterpart failed. We hold it and try to complete the pair
+/// on subsequent cycles rather than immediately selling at a loss.
+#[derive(Debug, Clone)]
+struct OrphanedLeg {
+    /// Which leg is filled: "ETH" (eth_up) or "BTC" (btc_down)
+    pub leg: &'static str,
+    pub token_id: String,
+    pub condition_id: String,
+    pub shares: f64,
+    pub entry_price: f64,
+    /// Timestamp (unix secs) when the orphan was recorded.
+    pub recorded_at: u64,
+    /// How many detection cycles we have waited so far.
+    pub cycles_waited: u32,
+    /// Window key of the market pair where this orphan was created.
+    pub window_key: String,
+}
+
 #[derive(Debug, Default)]
 struct ExecutionState {
     active_window_key: Option<String>,
     trade_count_by_direction: HashMap<String, usize>,
     shares_by_condition: HashMap<String, f64>,
     total_effective_cost_by_condition: HashMap<String, f64>,
+    /// At most one orphaned leg is tracked at a time (one-leg-fill is a rare event).
+    orphaned_leg: Option<OrphanedLeg>,
 }
 
 impl ExecutionState {
     fn reset_for_window(&mut self, window_key: String) {
         if self.active_window_key.as_ref() != Some(&window_key) {
+            if let Some(orphan) = self.orphaned_leg.take() {
+                warn!(
+                    "⚠️ Clearing orphan on window reset without recovery | old_window={} leg={} token={}",
+                    orphan.window_key,
+                    orphan.leg,
+                    &orphan.token_id[..12.min(orphan.token_id.len())],
+                );
+            }
             self.active_window_key = Some(window_key);
             self.trade_count_by_direction.clear();
             self.shares_by_condition.clear();
@@ -306,6 +342,39 @@ impl ExecutionState {
     fn total_btc_shares(&self, condition_id: &str) -> f64 {
         *self.shares_by_condition.get(condition_id).unwrap_or(&0.0)
     }
+
+    fn record_orphaned_leg(&mut self, orphan: OrphanedLeg) {
+        if self.orphaned_leg.is_some() {
+            warn!(
+                "⚠️  ORPHAN EXISTS | keeping existing orphan, ignoring new orphan leg={}",
+                orphan.leg
+            );
+            return;
+        }
+        warn!(
+            "🔶 ORPHANED LEG RECORDED | window={} leg={} token={} shares={:.2} entry_price={:.4}",
+            orphan.window_key,
+            orphan.leg,
+            &orphan.token_id[..12.min(orphan.token_id.len())],
+            orphan.shares,
+            orphan.entry_price
+        );
+        self.orphaned_leg = Some(orphan);
+    }
+
+    fn take_orphaned_leg(&mut self) -> Option<OrphanedLeg> {
+        self.orphaned_leg.take()
+    }
+
+    fn peek_orphaned_leg(&self) -> Option<&OrphanedLeg> {
+        self.orphaned_leg.as_ref()
+    }
+
+    fn tick_orphaned_cycles(&mut self) {
+        if let Some(ref mut orphan) = self.orphaned_leg {
+            orphan.cycles_waited += 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -381,66 +450,85 @@ impl Trader {
         Ok(())
     }
 
-    async fn emergency_unwind(
+    /// Record the filled leg as an orphan in state instead of immediately selling it.
+    /// Call this from the one-leg-fill handler to avoid the bid-ask spread loss.
+    async fn record_orphan_instead_of_unwind(
         &self,
-        executor: &ExecutorClient,
         token_id: &str,
-        size_shares: f64,
-        leg_label: &str,
-    ) -> Result<()> {
-        if size_shares <= 0.0 {
-            return Err(anyhow!(
-                "cannot unwind {} leg because size_shares is non-positive: {:.4}",
-                leg_label,
-                size_shares
-            ));
+        condition_id: &str,
+        shares: f64,
+        entry_price: f64,
+        leg: &'static str,
+        window_key: &str,
+    ) {
+        let orphan = OrphanedLeg {
+            leg,
+            token_id: token_id.to_string(),
+            condition_id: condition_id.to_string(),
+            shares,
+            entry_price,
+            recorded_at: now_ts(),
+            cycles_waited: 0,
+            window_key: window_key.to_string(),
+        };
+        let mut state = self.execution_state.lock().await;
+        state.record_orphaned_leg(orphan);
+    }
+
+    /// Check if we have an orphaned leg that has expired (too old or stop-loss hit).
+    /// Returns Some(token_id, shares, leg) if the orphan should be force-cashed out.
+    async fn check_orphan_expiry(
+        &self,
+        opportunity: &ArbitrageOpportunity,
+    ) -> Option<(String, f64, &'static str)> {
+        let state = self.execution_state.lock().await;
+        let orphan = state.peek_orphaned_leg()?;
+
+        let current_window = Self::window_key(opportunity);
+        if orphan.window_key != current_window {
+            warn!(
+                "⏰ ORPHAN WINDOW MISMATCH | orphan_window={} current_window={} leg={} → force cashout",
+                orphan.window_key, current_window, orphan.leg
+            );
+            return Some((orphan.token_id.clone(), orphan.shares, orphan.leg));
         }
 
-        let retry_delays_ms = [
-            0_u64,
-            imbalance_trim_settle_ms_from_env(),
-            imbalance_trim_settle_ms_retry_from_env(),
-        ];
-        let mut last_err: Option<anyhow::Error> = None;
-
-        for (idx, delay_ms) in retry_delays_ms.iter().enumerate() {
-            if *delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
-            }
-
-            match executor.cashout_position(token_id, size_shares).await {
-                Ok(resp) => {
-                    warn!(
-                        "🧯 Emergency unwind executed via cashout | leg={} attempt={} order_id={:?} requested_shares={:.4} executor_requested_shares={:?}",
-                        leg_label,
-                        idx + 1,
-                        resp.order_id,
-                        size_shares,
-                        resp.requested_shares
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    warn!(
-                        "❌ Emergency unwind attempt failed | leg={} attempt={} delay_ms={} error={}",
-                        leg_label,
-                        idx + 1,
-                        delay_ms,
-                        err
-                    );
-                    last_err = Some(err);
-                }
-            }
+        if orphan.cycles_waited >= orphaned_leg_max_cycles() {
+            warn!(
+                "⏰ ORPHAN EXPIRED | leg={} cycles_waited={} limit={} age_secs={} → force cashout",
+                orphan.leg,
+                orphan.cycles_waited,
+                orphaned_leg_max_cycles(),
+                now_ts().saturating_sub(orphan.recorded_at),
+            );
+            return Some((orphan.token_id.clone(), orphan.shares, orphan.leg));
         }
 
-        Err(anyhow!(
-            "failed to cashout {} leg after {} attempts: {}",
-            leg_label,
-            retry_delays_ms.len(),
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown error".to_string())
-        ))
+        let orphan_leg = orphan.leg;
+        let orphaned_token = orphan.token_id.clone();
+        let orphan_shares = orphan.shares;
+        let entry_price = orphan.entry_price;
+        drop(state);
+
+        let current_bid = if orphan_leg == "ETH" {
+            opportunity.eth_up_bid_price.to_f64().unwrap_or(entry_price)
+        } else {
+            opportunity
+                .btc_down_bid_price
+                .to_f64()
+                .unwrap_or(entry_price)
+        };
+
+        let threshold = entry_price * (1.0 - orphaned_leg_stop_loss_pct());
+        if current_bid < threshold {
+            warn!(
+                "🛑 ORPHAN STOP-LOSS | leg={} entry={:.4} current_bid={:.4} threshold={:.4} → force cashout",
+                orphan_leg, entry_price, current_bid, threshold
+            );
+            return Some((orphaned_token, orphan_shares, orphan_leg));
+        }
+
+        None
     }
 
     fn rebalance_plan(
@@ -683,6 +771,118 @@ impl Trader {
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
         self.refresh_balance().await?;
 
+        // ─────────────────────────────────────────────────────────────────────
+        // ORPHANED LEG CHECK — runs every cycle before any new-trade logic.
+        // If a previous one-leg-fill left an open position, we try to complete
+        // the pair here instead of entering a whole new position.
+        // ─────────────────────────────────────────────────────────────────────
+        if let Some(executor) = self.executor.as_ref() {
+            {
+                let mut state = self.execution_state.lock().await;
+                state.tick_orphaned_cycles();
+            }
+            if let Some((expired_token, expired_shares, expired_leg)) =
+                self.check_orphan_expiry(opportunity).await
+            {
+                let safe_shares = (expired_shares * 0.999).max(0.0);
+                warn!(
+                    "🧯 Force-cashing expired orphan | leg={} shares={:.4}",
+                    expired_leg, safe_shares
+                );
+                if safe_shares > 0.0 {
+                    let _ = executor.cashout_position(&expired_token, safe_shares).await;
+                }
+                let mut state = self.execution_state.lock().await;
+                state.take_orphaned_leg();
+            } else {
+                let orphan_snapshot = {
+                    let state = self.execution_state.lock().await;
+                    state.peek_orphaned_leg().cloned()
+                };
+
+                if let Some(orphan) = orphan_snapshot {
+                    info!(
+                        "🔶 ORPHAN RECOVERY | leg={} cycles_waited={}/{} trying to complete pair",
+                        orphan.leg,
+                        orphan.cycles_waited,
+                        orphaned_leg_max_cycles()
+                    );
+
+                    let (missing_token, missing_price, missing_condition, missing_leg_name) =
+                        if orphan.leg == "ETH" {
+                            (
+                                opportunity.btc_down_token_id.clone(),
+                                opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                opportunity.btc_condition_id.clone(),
+                                "BTC",
+                            )
+                        } else {
+                            (
+                                opportunity.eth_up_token_id.clone(),
+                                opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                opportunity.eth_condition_id.clone(),
+                                "ETH",
+                            )
+                        };
+
+                    let combined_effective = effective_buy_price(orphan.entry_price)
+                        + effective_buy_price(missing_price);
+                    let max_allowed =
+                        arbitrage_max_sum_from_env() + arbitrage_sum_tolerance_from_env();
+
+                    if combined_effective <= max_allowed {
+                        info!(
+                            "⚡ ORPHAN COMPLETE | buying missing {} leg @ {:.4} (combined_effective={:.4} ≤ {:.4})",
+                            missing_leg_name, missing_price, combined_effective, max_allowed
+                        );
+                        match executor
+                            .execute_order_with_fok(
+                                &missing_token,
+                                Side::Buy,
+                                missing_price,
+                                orphan.shares,
+                                false,
+                            )
+                            .await
+                        {
+                            Ok(resp) => {
+                                info!("✅ ORPHAN PAIR COMPLETED | order_id={:?}", resp.order_id);
+                                let mut state = self.execution_state.lock().await;
+                                state.take_orphaned_leg();
+                                Self::update_filled_state(
+                                    &mut state,
+                                    &orphan.condition_id,
+                                    orphan.shares,
+                                    effective_buy_price(orphan.entry_price),
+                                );
+                                Self::update_filled_state(
+                                    &mut state,
+                                    &missing_condition,
+                                    orphan.shares,
+                                    effective_buy_price(missing_price),
+                                );
+                                state.increment_direction(&opportunity.pair_label);
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "❌ ORPHAN COMPLETE FAILED | leg={} err={} — will retry next cycle",
+                                    missing_leg_name, e
+                                );
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "🚫 ORPHAN SKIP | combined_effective={:.4} > max_allowed={:.4} — arb no longer valid, will retry next cycle",
+                            combined_effective, max_allowed
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let window_key = Self::window_key(opportunity);
         let trade_limit = per_direction_trade_limit_from_env();
         let balance = self.live_usdc_balance.lock().await.to_f64().unwrap_or(0.0);
@@ -907,15 +1107,6 @@ impl Trader {
             );
         }
 
-        let min_total_spend = Config::min_trade_size();
-        if spend < min_total_spend {
-            warn!(
-                "❌ Trade skipped (below minimum total spend ${:.2})",
-                min_total_spend
-            );
-            return Ok(());
-        }
-
         if !rebalance_only {
             let state = self.execution_state.lock().await;
             if let Err(err) = Self::can_open_paired_position(&state, opportunity, units) {
@@ -1095,42 +1286,31 @@ impl Trader {
                             }
                         }
 
-                        if let Err(unwind_err) = self
-                            .emergency_unwind(
-                                executor,
-                                &opportunity.eth_up_token_id,
-                                size_shares,
-                                "ETH",
-                            )
-                            .await
-                        {
-                            let mut state = self.execution_state.lock().await;
-                            Self::update_filled_state(
-                                &mut state,
-                                &opportunity.eth_condition_id,
-                                units,
-                                effective_buy_price(
-                                    opportunity.eth_up_price.to_f64().unwrap_or_default(),
-                                ),
-                            );
-                            return Err(anyhow!(
-                                "second leg failed and ETH unwind failed after retries; tracked ETH as open residual. second_leg_error: {}; unwind_error: {}",
-                                e,
-                                unwind_err
-                            ));
-                        }
+                        warn!(
+                            "🔶 ONE-LEG FILL | ETH filled @ {:.4}, BTC failed. Recording orphan instead of cashout.",
+                            opportunity.eth_up_price
+                        );
+                        self.record_orphan_instead_of_unwind(
+                            &opportunity.eth_up_token_id,
+                            &opportunity.eth_condition_id,
+                            size_shares,
+                            opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                            "ETH",
+                            &Self::window_key(opportunity),
+                        )
+                        .await;
                         eth_resp = None;
 
                         one_leg_incident = true;
                         if executor.allow_partial_arb() {
                             warn!(
-                                "⚠️ BTC leg failed after ETH fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
+                                "⚠️ BTC leg failed after ETH fill; orphan recorded, bot will retry completion next cycle (ALLOW_PARTIAL_ARB=true)"
                             );
                             break;
                         }
 
                         return Err(anyhow!(
-                            "second leg failed after ETH fill; first leg unwind submitted. error: {}",
+                            "second leg failed after ETH fill; orphan recorded for recovery next cycle. error: {}",
                             e
                         ));
                     }
@@ -1140,42 +1320,31 @@ impl Trader {
                             attempt, attempts, e
                         );
 
-                        if let Err(unwind_err) = self
-                            .emergency_unwind(
-                                executor,
-                                &opportunity.btc_down_token_id,
-                                size_shares,
-                                "BTC",
-                            )
-                            .await
-                        {
-                            let mut state = self.execution_state.lock().await;
-                            Self::update_filled_state(
-                                &mut state,
-                                &opportunity.btc_condition_id,
-                                units,
-                                effective_buy_price(
-                                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
-                                ),
-                            );
-                            return Err(anyhow!(
-                                "first leg failed and BTC unwind failed after retries; tracked BTC as open residual. first_leg_error: {}; unwind_error: {}",
-                                e,
-                                unwind_err
-                            ));
-                        }
+                        warn!(
+                            "🔶 ONE-LEG FILL | BTC filled @ {:.4}, ETH failed. Recording orphan instead of cashout.",
+                            opportunity.btc_down_price
+                        );
+                        self.record_orphan_instead_of_unwind(
+                            &opportunity.btc_down_token_id,
+                            &opportunity.btc_condition_id,
+                            size_shares,
+                            opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                            "BTC",
+                            &Self::window_key(opportunity),
+                        )
+                        .await;
                         btc_resp = None;
 
                         one_leg_incident = true;
                         if executor.allow_partial_arb() {
                             warn!(
-                                "⚠️ ETH leg failed after BTC fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
+                                "⚠️ ETH leg failed after BTC fill; orphan recorded, bot will retry completion next cycle (ALLOW_PARTIAL_ARB=true)"
                             );
                             break;
                         }
 
                         return Err(anyhow!(
-                            "first leg failed after BTC fill; second leg unwind submitted. error: {}",
+                            "first leg failed after BTC fill; orphan recorded for recovery next cycle. error: {}",
                             e
                         ));
                     }
