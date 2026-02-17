@@ -232,6 +232,12 @@ struct OrphanedLeg {
     pub cycles_waited: u32,
     /// Window key of the market pair where this orphan was created.
     pub window_key: String,
+    /// If we submitted a GTC for the missing leg, keep pending metadata until it truly fills.
+    pub pending_completion_order_id: Option<String>,
+    pub pending_missing_token_id: Option<String>,
+    pub pending_missing_condition_id: Option<String>,
+    pub pending_missing_price: Option<f64>,
+    pub pending_missing_pre_shares: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -247,14 +253,6 @@ struct ExecutionState {
 impl ExecutionState {
     fn reset_for_window(&mut self, window_key: String) {
         if self.active_window_key.as_ref() != Some(&window_key) {
-            if let Some(orphan) = self.orphaned_leg.take() {
-                warn!(
-                    "⚠️ Clearing orphan on window reset without recovery | old_window={} leg={} token={}",
-                    orphan.window_key,
-                    orphan.leg,
-                    &orphan.token_id[..12.min(orphan.token_id.len())],
-                );
-            }
             self.active_window_key = Some(window_key);
             self.trade_count_by_direction.clear();
             self.shares_by_condition.clear();
@@ -424,15 +422,20 @@ impl Trader {
         state.add_effective_cost(condition_id, shares * effective_price_per_share);
     }
 
+    fn min_expected_fill(expected_shares: f64) -> f64 {
+        (expected_shares * 0.98).max(expected_shares - 1.0)
+    }
+
     async fn verify_executor_fill(
         &self,
         executor: &ExecutorClient,
         token_id: &str,
         expected_shares: f64,
+        baseline_shares: f64,
     ) -> Result<bool> {
         let observed = executor.get_token_shares(token_id).await?;
-        let min_expected = (expected_shares * 0.98).max(expected_shares - 1.0);
-        Ok(observed + f64::EPSILON >= min_expected)
+        let delta = (observed - baseline_shares).max(0.0);
+        Ok(delta + f64::EPSILON >= Self::min_expected_fill(expected_shares))
     }
 
     fn can_open_paired_position(
@@ -481,6 +484,11 @@ impl Trader {
             recorded_at: now_ts(),
             cycles_waited: 0,
             window_key: window_key.to_string(),
+            pending_completion_order_id: None,
+            pending_missing_token_id: None,
+            pending_missing_condition_id: None,
+            pending_missing_price: None,
+            pending_missing_pre_shares: None,
         };
         let mut state = self.execution_state.lock().await;
         state.record_orphaned_leg(orphan);
@@ -836,14 +844,76 @@ impl Trader {
                             )
                         };
 
+                    if let (
+                        Some(pending_order_id),
+                        Some(pending_token),
+                        Some(pre_shares),
+                        Some(pending_condition),
+                        Some(pending_price),
+                    ) = (
+                        orphan.pending_completion_order_id.clone(),
+                        orphan.pending_missing_token_id.clone(),
+                        orphan.pending_missing_pre_shares,
+                        orphan.pending_missing_condition_id.clone(),
+                        orphan.pending_missing_price,
+                    ) {
+                        let pending_filled = self
+                            .verify_executor_fill(
+                                executor,
+                                &pending_token,
+                                orphan.shares,
+                                pre_shares,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    "⚠️ ORPHAN pending verification failed | order_id={:?} err={}",
+                                    pending_order_id, e
+                                );
+                                false
+                            });
+
+                        if pending_filled {
+                            info!(
+                                "✅ ORPHAN PAIR COMPLETED | order_id={:?} verified_filled=true",
+                                pending_order_id
+                            );
+                            let mut state = self.execution_state.lock().await;
+                            state.take_orphaned_leg();
+                            Self::update_filled_state(
+                                &mut state,
+                                &orphan.condition_id,
+                                orphan.shares,
+                                effective_buy_price(orphan.entry_price),
+                            );
+                            Self::update_filled_state(
+                                &mut state,
+                                &pending_condition,
+                                orphan.shares,
+                                effective_buy_price(pending_price),
+                            );
+                            state.increment_direction(&opportunity.pair_label);
+                        } else {
+                            info!(
+                                "⏳ ORPHAN COMPLETION PENDING | order_id={:?} waiting_for_fill=true",
+                                pending_order_id
+                            );
+                        }
+                        return Ok(());
+                    }
+
                     let combined_effective = effective_buy_price(orphan.entry_price)
                         + effective_buy_price(missing_price);
                     let max_allowed =
                         arbitrage_max_sum_from_env() + arbitrage_sum_tolerance_from_env();
 
                     if combined_effective <= max_allowed {
+                        let pre_shares = executor
+                            .get_token_shares(&missing_token)
+                            .await
+                            .unwrap_or(0.0);
                         info!(
-                            "⚡ ORPHAN COMPLETE | buying missing {} leg @ {:.4} (combined_effective={:.4} ≤ {:.4})",
+                            "⚡ ORPHAN COMPLETE SUBMIT | buying missing {} leg @ {:.4} (combined_effective={:.4} ≤ {:.4})",
                             missing_leg_name, missing_price, combined_effective, max_allowed
                         );
                         match executor
@@ -857,22 +927,20 @@ impl Trader {
                             .await
                         {
                             Ok(resp) => {
-                                info!("✅ ORPHAN PAIR COMPLETED | order_id={:?}", resp.order_id);
+                                info!(
+                                    "⏳ ORPHAN COMPLETION SUBMITTED | order_id={:?} awaiting_fill_confirmation=true",
+                                    resp.order_id
+                                );
                                 let mut state = self.execution_state.lock().await;
-                                state.take_orphaned_leg();
-                                Self::update_filled_state(
-                                    &mut state,
-                                    &orphan.condition_id,
-                                    orphan.shares,
-                                    effective_buy_price(orphan.entry_price),
-                                );
-                                Self::update_filled_state(
-                                    &mut state,
-                                    &missing_condition,
-                                    orphan.shares,
-                                    effective_buy_price(missing_price),
-                                );
-                                state.increment_direction(&opportunity.pair_label);
+                                if let Some(ref mut live_orphan) = state.orphaned_leg {
+                                    live_orphan.pending_completion_order_id = resp.order_id;
+                                    live_orphan.pending_missing_token_id = Some(missing_token);
+                                    live_orphan.pending_missing_condition_id =
+                                        Some(missing_condition);
+                                    live_orphan.pending_missing_price = Some(missing_price);
+                                    live_orphan.pending_missing_pre_shares = Some(pre_shares);
+                                    live_orphan.cycles_waited = 0;
+                                }
                                 return Ok(());
                             }
                             Err(e) => {
@@ -1203,6 +1271,15 @@ impl Trader {
                     }
                 }
 
+                let pre_eth_shares = executor
+                    .get_token_shares(&opportunity.eth_up_token_id)
+                    .await
+                    .unwrap_or(0.0);
+                let pre_btc_shares = executor
+                    .get_token_shares(&opportunity.btc_down_token_id)
+                    .await
+                    .unwrap_or(0.0);
+
                 let eth_future = executor.execute_order(
                     &opportunity.eth_up_token_id,
                     Side::Buy,
@@ -1228,6 +1305,7 @@ impl Trader {
                                 executor,
                                 &opportunity.eth_up_token_id,
                                 size_shares,
+                                pre_eth_shares,
                             )
                             .await
                             .unwrap_or_else(|e| {
@@ -1239,6 +1317,7 @@ impl Trader {
                                 executor,
                                 &opportunity.btc_down_token_id,
                                 size_shares,
+                                pre_btc_shares,
                             )
                             .await
                             .unwrap_or_else(|e| {
