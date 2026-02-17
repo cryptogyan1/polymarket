@@ -294,45 +294,6 @@ impl ExecutorClient {
         Ok(parsed)
     }
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("failed to fetch token position from executor")?;
-
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .context("failed to read executor position response body")?;
-
-        if !status.is_success() {
-            let detail = parse_error_detail(&body);
-            return Err(anyhow!(
-                "executor rejected position query (status {}): {}",
-                status,
-                detail
-            ));
-        }
-
-        let parsed: PositionResponse = serde_json::from_str(&body).with_context(|| {
-            format!(
-                "executor returned invalid JSON for position success response: {}",
-                body
-            )
-        })?;
-
-        if !parsed.ok {
-            return Err(anyhow!(
-                "executor returned unsuccessful position query (status {}): token={}",
-                status,
-                parsed.token_id
-            ));
-        }
-
-        Ok(parsed.shares)
-    }
     pub async fn notify_trade_success(
         &self,
         direction: &str,
