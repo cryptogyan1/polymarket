@@ -46,6 +46,7 @@ MIN_SHARES = float(os.getenv("MIN_SHARES", "5"))
 MAX_SHARES_RAW = os.getenv("MAX_SHARES", "").strip()
 MAX_SHARES = float(MAX_SHARES_RAW) if MAX_SHARES_RAW else None
 STRICT_SHARE_BOUNDS = os.getenv("STRICT_SHARE_BOUNDS", "true").strip().lower() == "true"
+FOK_BUY_DEFAULT = os.getenv("FOK_BUY", "").strip().lower() == "true"
 
 app = FastAPI(title="polymarket-executor", version="1.0.4")
 
@@ -56,6 +57,7 @@ class ExecuteOrderRequest(BaseModel):
     price: float = Field(gt=0.0, lt=1.0)
     size_usdc: float = Field(gt=0.0)
     fok: bool = False
+    fok_buy: Optional[bool] = None
 
 
 class ExecuteOrderResponse(BaseModel):
@@ -171,7 +173,6 @@ def build_order_args(
     side: int,
     price: float,
     size_usdc: float,
-    fok: bool = False,
     fee_rate_bps: Optional[int] = None,
 ) -> OrderArgs:
     payload = {
@@ -398,18 +399,28 @@ def execute(req: ExecuteOrderRequest):
     try:
         side = BUY if req.side == "BUY" else SELL
         clamped_size = clamp_order_size(req.size_usdc, side)
+
+        buy_fok = req.fok_buy if req.fok_buy is not None else (FOK_BUY_DEFAULT or req.fok)
+        use_fok = buy_fok if side == BUY else req.fok
+
+        if side == BUY:
+            buy_notional = clamped_size * req.price
+            if buy_notional < 1.0:
+                raise ValueError(
+                    f"buy order below Polymarket $1 minimum: ${buy_notional:.2f} (shares={clamped_size:.2f}, price=${req.price:.4f})"
+                )
+
         order_args = build_order_args(
             token_id=req.token_id,
             side=side,
             price=req.price,
             size_usdc=clamped_size,
-            fok=req.fok,
             fee_rate_bps=resolve_fee_rate_bps(),
         )
 
         try:
             signed = CLIENT.create_order(order_args)
-            result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
+            result = CLIENT.post_order(signed, OrderType.FOK if use_fok else OrderType.GTC)
         except Exception as exc:
             market_fee_bps = extract_market_fee_bps(exc)
             if market_fee_bps is None:
@@ -425,11 +436,10 @@ def execute(req: ExecuteOrderRequest):
                 side=side,
                 price=req.price,
                 size_usdc=clamped_size,
-                fok=req.fok,
                 fee_rate_bps=effective_fee_bps,
             )
             signed = CLIENT.create_order(retry_args)
-            result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
+            result = CLIENT.post_order(signed, OrderType.FOK if use_fok else OrderType.GTC)
 
         order_id = None
         if isinstance(result, dict):

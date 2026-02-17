@@ -11,9 +11,9 @@ pub struct ExecutorClient {
     base_url: String,
     http: Client,
     fok_enabled: bool,
+    fok_buy_enabled: bool,
     allow_partial_arb: bool,
 }
-
 
 #[derive(Debug, Serialize)]
 pub struct TelegramNotifyRequest {
@@ -33,6 +33,7 @@ pub struct ExecuteOrderRequest {
     pub price: f64,
     pub size_usdc: f64,
     pub fok: bool,
+    pub fok_buy: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +70,11 @@ impl ExecutorClient {
             .trim()
             .eq_ignore_ascii_case("true");
 
+        let fok_buy_enabled = std::env::var("FOK_BUY")
+            .ok()
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(fok_enabled);
+
         let allow_partial_arb = std::env::var("ALLOW_PARTIAL_ARB")
             .unwrap_or_else(|_| "false".to_string())
             .trim()
@@ -78,6 +84,7 @@ impl ExecutorClient {
             base_url,
             http,
             fok_enabled,
+            fok_buy_enabled,
             allow_partial_arb,
         })
     }
@@ -88,6 +95,10 @@ impl ExecutorClient {
 
     pub fn allow_partial_arb(&self) -> bool {
         self.allow_partial_arb
+    }
+
+    pub fn fok_buy_enabled(&self) -> bool {
+        self.fok_buy_enabled
     }
 
     pub async fn healthcheck(&self) -> Result<()> {
@@ -114,7 +125,12 @@ impl ExecutorClient {
         price: f64,
         size_usdc: f64,
     ) -> Result<ExecuteOrderResponse> {
-        self.execute_order_with_fok(token_id, side, price, size_usdc, self.fok_enabled)
+        let fok_for_side = match side {
+            Side::Buy => self.fok_buy_enabled,
+            Side::Sell => self.fok_enabled,
+        };
+
+        self.execute_order_with_fok(token_id, side, price, size_usdc, fok_for_side)
             .await
     }
 
@@ -132,12 +148,18 @@ impl ExecutorClient {
             Side::Sell => "SELL".to_string(),
         };
 
+        let fok_buy = match side.as_str() {
+            "BUY" => Some(fok),
+            _ => None,
+        };
+
         let payload = ExecuteOrderRequest {
             token_id: token_id.to_string(),
             side,
             price,
             size_usdc,
             fok,
+            fok_buy,
         };
 
         let resp = self
@@ -180,7 +202,6 @@ impl ExecutorClient {
 
         Ok(parsed)
     }
-
 
     pub async fn notify_trade_success(
         &self,

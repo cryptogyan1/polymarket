@@ -14,6 +14,7 @@ use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
 use log::{info, warn};
+use rand::Rng;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -116,6 +117,18 @@ fn env_settings() -> &'static ExecutionEnv {
 
 fn min_shares_from_env() -> f64 {
     env_settings().min_shares
+}
+
+fn random_whole_shares_in_range(min_units: f64, max_units: f64) -> f64 {
+    let min_whole = min_units.ceil().max(1.0) as u64;
+    let max_whole = max_units.floor().max(0.0) as u64;
+
+    if max_whole <= min_whole {
+        return min_whole as f64;
+    }
+
+    let mut rng = rand::thread_rng();
+    rng.gen_range(min_whole..=max_whole) as f64
 }
 
 fn max_shares_cap_from_env() -> Option<f64> {
@@ -864,6 +877,29 @@ impl Trader {
             }
         }
 
+        if !rebalance_only {
+            let min_units_for_random = min_shares.ceil();
+            let max_units_for_random = units.floor();
+            if max_units_for_random < min_units_for_random {
+                warn!(
+                    "❌ Trade skipped (insufficient equal whole shares after caps): max_whole={:.0} < min_whole={:.0}",
+                    max_units_for_random,
+                    min_units_for_random
+                );
+                return Ok(());
+            }
+
+            let randomized_units =
+                random_whole_shares_in_range(min_units_for_random, max_units_for_random);
+            if (randomized_units - units).abs() > f64::EPSILON {
+                info!(
+                    "🎲 Randomized equal shares within bounds: {:.0} -> {:.0} (range {:.0}-{:.0})",
+                    units, randomized_units, min_units_for_random, max_units_for_random
+                );
+            }
+            units = randomized_units;
+        }
+
         if units < min_shares {
             warn!(
                 "❌ Trade skipped after caps (minimum shares not met): shares={:.2} < {:.2}",
@@ -959,8 +995,9 @@ impl Trader {
 
             info!("🧮 Executor order sizing | shares_per_leg={}", units);
             info!(
-                "🛡️ Execution safeguards | FOK={} ALLOW_PARTIAL_ARB={} RETRIES={}",
+                "🛡️ Execution safeguards | FOK={} FOK_BUY={} ALLOW_PARTIAL_ARB={} RETRIES={}",
                 executor.fok_enabled(),
+                executor.fok_buy_enabled(),
                 executor.allow_partial_arb(),
                 executor_retry_attempts_from_env()
             );
