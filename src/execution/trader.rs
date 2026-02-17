@@ -16,7 +16,7 @@ use crate::domain::ArbitrageOpportunity;
 use crate::execution::clob_client::ClobClient;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
 
-const MIN_ORDER_USDC: f64 = 1.0;
+const DEFAULT_MIN_ORDER_USDC: f64 = 0.0;
 
 pub struct Trader {
     api: Arc<PolymarketClient>,
@@ -50,6 +50,13 @@ impl Trader {
             .unwrap_or(0.99)
     }
 
+    fn min_order_usdc() -> f64 {
+        env::var("MIN_ORDER_USDC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MIN_ORDER_USDC)
+    }
+
     fn calculate_position_size(&self, balance: f64, opportunity: &ArbitrageOpportunity) -> f64 {
         use crate::config::TradeMode;
 
@@ -68,13 +75,13 @@ impl Trader {
                 if profit_margin > 0.0 {
                     (balance * (max_risk / 100.0)) / profit_margin
                 } else {
-                    MIN_ORDER_USDC
+                    Self::min_order_usdc()
                 }
             }
             TradeMode::Free => balance.min(100.0),
         };
 
-        raw_size.max(MIN_ORDER_USDC)
+        raw_size.max(Self::min_order_usdc())
     }
 
     pub async fn execute_arbitrage(&self, opp: &ArbitrageOpportunity) -> Result<()> {
@@ -100,10 +107,12 @@ impl Trader {
 
         info!("💰 Current balance: ${:.2}", balance);
 
-        if balance < MIN_ORDER_USDC {
+        let min_order_usdc = Self::min_order_usdc();
+
+        if balance < min_order_usdc {
             warn!(
                 "⚠️  Insufficient balance for trading (min ${:.2})",
-                MIN_ORDER_USDC
+                min_order_usdc
             );
             return Ok(());
         }
@@ -132,7 +141,7 @@ impl Trader {
         if balance < required {
             let adjusted_size = balance / 2.0;
             info!("⚠️  Adjusting size to ${:.2} to fit balance", adjusted_size);
-            if adjusted_size < MIN_ORDER_USDC {
+            if adjusted_size < min_order_usdc {
                 warn!("⚠️  Cannot execute - insufficient balance for both legs");
                 return Ok(());
             }
