@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from html import escape
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -66,9 +67,10 @@ class TelegramNotifier:
 
     async def send_startup_notification(self, service_name: str = "polymarket-executor") -> None:
         """Send a startup heartbeat message so operators know bot is live."""
+        safe_service_name = self._esc(service_name)
         message = f"""🟢 <b>BOT STARTED</b>
 
-Service: <b>{service_name}</b>
+Service: <b>{safe_service_name}</b>
 Time: {self.format_timestamp()}
 Status: Running and ready to send trade/unwind alerts.
 """
@@ -82,21 +84,26 @@ Status: Running and ready to send trade/unwind alerts.
     async def send_both_legs_filled(self, trade: TradeResult) -> None:
         profit_value = trade.profit_potential or 0.0
         profit_pct = (profit_value / trade.total_cost * 100.0) if trade.total_cost > 0 else 0.0
+        direction = self._esc(trade.direction)
+        leg1_token = self._esc(trade.leg1.token)
+        leg2_token = self._esc(trade.leg2.token)
+        leg1_order_id = self._esc(self._shorten_id(trade.leg1.order_id))
+        leg2_order_id = self._esc(self._shorten_id(trade.leg2.order_id))
 
         message = f"""🎯 <b>ARBITRAGE FILLED</b>
 
 📊 Market Window: {trade.timestamp}
-Direction: {trade.direction}
+Direction: {direction}
 
-<b>LEG 1: {trade.leg1.token}</b>
+<b>LEG 1: {leg1_token}</b>
 ✅ Filled: {trade.leg1.shares:.0f} shares @ ${trade.leg1.price:.3f}
 💰 Cost: ${trade.leg1.cost_usdc:.2f} USDC
-📋 Order ID: <code>{self._shorten_id(trade.leg1.order_id)}</code>
+📋 Order ID: <code>{leg1_order_id}</code>
 
-<b>LEG 2: {trade.leg2.token}</b>
+<b>LEG 2: {leg2_token}</b>
 ✅ Filled: {trade.leg2.shares:.0f} shares @ ${trade.leg2.price:.3f}
 💰 Cost: ${trade.leg2.cost_usdc:.2f} USDC
-📋 Order ID: <code>{self._shorten_id(trade.leg2.order_id)}</code>
+📋 Order ID: <code>{leg2_order_id}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━
 💵 Total Cost: ${trade.total_cost:.2f} USDC
@@ -115,6 +122,10 @@ Direction: {trade.direction}
     async def send_one_leg_alert(self, trade: TradeResult) -> None:
         filled_leg = trade.leg1 if trade.leg1.status == "filled" else trade.leg2
         failed_leg = trade.leg2 if trade.leg1.status == "filled" else trade.leg1
+        filled_token = self._esc(filled_leg.token)
+        failed_token = self._esc(failed_leg.token)
+        filled_order_id = self._esc(self._shorten_id(filled_leg.order_id))
+        failed_error = self._esc(failed_leg.error or "Unknown error")
 
         message = f"""⚠️ <b>PARTIAL FILL ALERT</b>
 
@@ -122,20 +133,20 @@ Direction: {trade.direction}
 ⏰ {trade.timestamp}
 
 <b>FILLED LEG:</b>
-✅ {filled_leg.token}
+✅ {filled_token}
    • Shares: {filled_leg.shares:.0f} @ ${filled_leg.price:.3f}
    • Cost: ${filled_leg.cost_usdc:.2f} USDC
-   • Order ID: <code>{self._shorten_id(filled_leg.order_id)}</code>
+   • Order ID: <code>{filled_order_id}</code>
 
 <b>FAILED LEG:</b>
-❌ {failed_leg.token}
+❌ {failed_token}
    • Target: {failed_leg.shares:.0f} shares @ ${failed_leg.price:.3f}
    • Status: Order rejected
-   • Error: \"{failed_leg.error or 'Unknown error'}\"
+   • Error: \"{failed_error}\"
 
 ━━━━━━━━━━━━━━━━━━━━━
 ⚠️ <b>EXPOSURE RISK:</b>
-• Holding {filled_leg.shares:.0f} {filled_leg.token} shares
+• Holding {filled_leg.shares:.0f} {filled_token} shares
 • No hedge position
 • Market risk: ACTIVE
 
@@ -151,8 +162,10 @@ Bot will attempt automatic unwind.
         )
 
     async def send_unwind_initiated(self, unwind: UnwindInfo) -> int:
+        safe_direction = self._esc(unwind.original_direction)
+        safe_token = self._esc(unwind.token)
         direction_line = (
-            f"Pair: {unwind.original_direction}\n" if unwind.original_direction else ""
+            f"Pair: {safe_direction}\n" if unwind.original_direction else ""
         )
         message = f"""🔄 <b>UNWINDING POSITION</b>
 
@@ -160,7 +173,7 @@ Bot will attempt automatic unwind.
 ⏰ {unwind.timestamp}
 {direction_line}
 <b>UNWINDING:</b>
-📉 Selling: <b>{unwind.shares_to_sell:.0f} {unwind.token} shares</b>
+📉 Selling: <b>{unwind.shares_to_sell:.0f} {safe_token} shares</b>
 💵 Original Cost: ${unwind.original_cost:.2f} USDC
 📊 Market Sell Order (GTC)
 
@@ -183,15 +196,17 @@ Bot will attempt automatic unwind.
         net_result = received - unwind.original_cost
         net_pct = (net_result / unwind.original_cost * 100.0) if unwind.original_cost > 0 else 0.0
 
+        safe_token = self._esc(unwind.token)
+        safe_order_id = self._esc(self._shorten_id(unwind.order_id))
         message = f"""✅ <b>UNWIND COMPLETE</b>
 
 🔄 Position closed
 ⏰ {unwind.timestamp}
 
 <b>SOLD:</b>
-📉 {unwind.shares_to_sell:.0f} {unwind.token} shares @ ${market_price:.3f}
+📉 {unwind.shares_to_sell:.0f} {safe_token} shares @ ${market_price:.3f}
 💰 Received: ${received:.2f} USDC
-📋 Order ID: <code>{self._shorten_id(unwind.order_id)}</code>
+📋 Order ID: <code>{safe_order_id}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━
 💸 <b>NET RESULT:</b> {'Loss' if net_result < 0 else 'Gain'}: <b>${net_result:.2f} ({net_pct:+.2f}%)</b>
@@ -213,12 +228,14 @@ Bot will attempt automatic unwind.
                 self._unwind_message_ids.pop(unwind.token, None)
 
     async def send_unwind_failed(self, unwind: UnwindInfo, error: str) -> None:
+        safe_token = self._esc(unwind.token)
+        safe_error = self._esc(error)
         message = f"""❌ <b>UNWIND FAILED</b>
 
 ⏰ {unwind.timestamp}
-Token: {unwind.token}
+Token: {safe_token}
 Requested shares: {unwind.shares_to_sell:.4f}
-Error: {error}
+Error: {safe_error}
 """
         await self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode=ParseMode.HTML)
 
@@ -234,6 +251,10 @@ Error: {error}
         if len(order_id) > 14:
             return f"{order_id[:6]}...{order_id[-4:]}"
         return order_id
+
+    @staticmethod
+    def _esc(value: Any) -> str:
+        return escape(str(value), quote=False)
 
 
 def leg_info_from_dict(data: Dict[str, Any]) -> LegInfo:
