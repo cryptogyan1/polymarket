@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import os
 import threading
 import re
@@ -258,6 +259,65 @@ def init_client() -> ClobClient:
     return client
 
 
+class TelegramDispatchRunner:
+    def __init__(self) -> None:
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+
+        ready = threading.Event()
+
+        def _run_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            ready.set()
+            loop.run_forever()
+
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+        self._thread = threading.Thread(target=_run_loop, daemon=True)
+        self._thread.start()
+        ready.wait(timeout=2)
+
+    def submit(self, coro) -> None:
+        if self._loop is None:
+            self.start()
+
+        if self._loop is None:
+            print('[executor] telegram notification failed: dispatcher loop unavailable')
+            return
+
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+        def _done_callback(done: concurrent.futures.Future) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                print(f"[executor] telegram notification failed: {exc}")
+
+        future.add_done_callback(_done_callback)
+
+    def stop(self) -> None:
+        loop = self._loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+        self._thread = None
+        self._loop = None
+
+
 CLIENT = init_client()
 GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "true"
@@ -265,14 +325,15 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "tr
 if TELEGRAM_ENABLED:
     try:
         NOTIFIER = TelegramNotifier()
+        TELEGRAM_DISPATCHER = TelegramDispatchRunner()
         print("[executor] Telegram notifications enabled")
     except Exception as exc:
         print(f"[executor] failed to initialize Telegram notifier: {exc}")
         NOTIFIER = None
+        TELEGRAM_DISPATCHER = None
 else:
     NOTIFIER = None
-
-
+    TELEGRAM_DISPATCHER = None
 
 
 def _env_bool_any(keys, default: Optional[bool] = None) -> Optional[bool]:
@@ -301,16 +362,10 @@ def configured_pair_name() -> str:
 
 
 def send_telegram_notification(coro) -> None:
-    if NOTIFIER is None:
+    if NOTIFIER is None or TELEGRAM_DISPATCHER is None:
         return
 
-    def _runner():
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            print(f"[executor] telegram notification failed: {exc}")
-
-    threading.Thread(target=_runner, daemon=True).start()
+    TELEGRAM_DISPATCHER.submit(coro)
 
 
 @app.on_event("startup")
@@ -318,10 +373,19 @@ async def startup_event():
     if NOTIFIER is None:
         return
 
+    if TELEGRAM_DISPATCHER is not None:
+        TELEGRAM_DISPATCHER.start()
+
     try:
-        await NOTIFIER.send_startup_notification("polymarket-executor")
+        send_telegram_notification(NOTIFIER.send_startup_notification("polymarket-executor"))
     except Exception as exc:
         print(f"[executor] failed to send startup telegram notification: {exc}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if TELEGRAM_DISPATCHER is not None:
+        TELEGRAM_DISPATCHER.stop()
 
 
 @app.get("/health")
