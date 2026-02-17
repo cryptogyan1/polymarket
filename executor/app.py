@@ -5,6 +5,7 @@ import threading
 import re
 import traceback
 from math import floor
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -46,6 +47,8 @@ MIN_SHARES = float(os.getenv("MIN_SHARES", "5"))
 MAX_SHARES_RAW = os.getenv("MAX_SHARES", "").strip()
 MAX_SHARES = float(MAX_SHARES_RAW) if MAX_SHARES_RAW else None
 STRICT_SHARE_BOUNDS = os.getenv("STRICT_SHARE_BOUNDS", "true").strip().lower() == "true"
+CREATE_ORDER_RETRY_ATTEMPTS = max(1, int(os.getenv("CREATE_ORDER_RETRY_ATTEMPTS", "2")))
+CREATE_ORDER_RETRY_DELAY_MS = max(0, int(os.getenv("CREATE_ORDER_RETRY_DELAY_MS", "250")))
 
 app = FastAPI(title="polymarket-executor", version="1.0.4")
 
@@ -213,6 +216,36 @@ def resolve_fee_rate_bps(market_fee_bps: Optional[int] = None) -> Optional[int]:
             print(f"[executor] invalid EXECUTOR_FEE_BPS='{FEE_BPS_OVERRIDE}', ignoring override")
 
     return market_fee_bps
+
+
+def is_transient_clob_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "server disconnected" in message
+        or "request exception" in message
+        or "remoteprotocolerror" in message
+        or "timed out" in message
+    )
+
+
+def create_order_with_retry(order_args: OrderArgs):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, CREATE_ORDER_RETRY_ATTEMPTS + 1):
+        try:
+            return CLIENT.create_order(order_args)
+        except Exception as exc:
+            last_exc = exc
+            if not is_transient_clob_error(exc) or attempt >= CREATE_ORDER_RETRY_ATTEMPTS:
+                raise
+            wait_s = CREATE_ORDER_RETRY_DELAY_MS / 1000.0
+            print(
+                f"[executor] transient create_order failure (attempt {attempt}/{CREATE_ORDER_RETRY_ATTEMPTS}): {exc}. "
+                f"retrying in {wait_s:.3f}s"
+            )
+            time.sleep(wait_s)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("create_order_with_retry exhausted without error or result")
 
 def init_client() -> ClobClient:
     private_key, funder = resolve_funder_address(PRIVATE_KEY, PROXY_WALLET)
@@ -408,7 +441,7 @@ def execute(req: ExecuteOrderRequest):
         )
 
         try:
-            signed = CLIENT.create_order(order_args)
+            signed = create_order_with_retry(order_args)
             result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
         except Exception as exc:
             market_fee_bps = extract_market_fee_bps(exc)
@@ -428,7 +461,7 @@ def execute(req: ExecuteOrderRequest):
                 fok=req.fok,
                 fee_rate_bps=effective_fee_bps,
             )
-            signed = CLIENT.create_order(retry_args)
+            signed = create_order_with_retry(retry_args)
             result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
 
         order_id = None
