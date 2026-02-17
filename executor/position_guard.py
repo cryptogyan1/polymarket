@@ -108,8 +108,17 @@ class PositionGuard:
             available = max(0.0, self.get_token_shares(token_id))
             base_qty = min(target_qty, available) if shares is not None else available
 
-            # 99% first attempt, progressively down to 96% on later attempts.
-            safety_factor = max(0.96, 0.99 - (0.01 * attempt))
+            # If the caller provided an explicit share target (e.g. emergency unwind
+            # after one-leg fill), try to sell that full amount first to avoid leaving
+            # residual dust that can accumulate over time.
+            #
+            # For balance-refresh paths, keep a conservative fallback that scales down
+            # progressively across retries.
+            if shares is not None and attempt == 0:
+                safety_factor = 1.0
+            else:
+                # 99% first fallback attempt, progressively down to 96%.
+                safety_factor = max(0.96, 0.99 - (0.01 * attempt))
             adjusted_qty = max(0.0, base_qty * safety_factor)
 
             if adjusted_qty <= 0.0:
