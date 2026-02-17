@@ -40,6 +40,7 @@ struct ExecutionEnv {
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
     imbalance_trim_settle_ms: u64,
+    imbalance_trim_settle_ms_retry: u64,
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -101,6 +102,10 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(800),
+        imbalance_trim_settle_ms_retry: std::env::var("IMBALANCE_TRIM_SETTLE_MS_RETRY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300),
     }
 }
 
@@ -159,6 +164,10 @@ fn max_total_shares_per_market_from_env() -> Option<f64> {
 
 fn imbalance_trim_settle_ms_from_env() -> u64 {
     env_settings().imbalance_trim_settle_ms
+}
+
+fn imbalance_trim_settle_ms_retry_from_env() -> u64 {
+    env_settings().imbalance_trim_settle_ms_retry
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -387,7 +396,11 @@ impl Trader {
             ));
         }
 
-        let retry_delays_ms = [0_u64, imbalance_trim_settle_ms_from_env(), 300_u64];
+        let retry_delays_ms = [
+            0_u64,
+            imbalance_trim_settle_ms_from_env(),
+            imbalance_trim_settle_ms_retry_from_env(),
+        ];
         let mut last_err: Option<anyhow::Error> = None;
 
         for (idx, delay_ms) in retry_delays_ms.iter().enumerate() {
