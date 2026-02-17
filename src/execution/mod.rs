@@ -39,6 +39,7 @@ struct ExecutionEnv {
     trade_fee_bps: f64,
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
+    imbalance_trim_settle_ms: u64,
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -96,6 +97,10 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0),
+        imbalance_trim_settle_ms: std::env::var("IMBALANCE_TRIM_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(800),
     }
 }
 
@@ -150,6 +155,10 @@ fn slippage_bps_from_env() -> f64 {
 
 fn max_total_shares_per_market_from_env() -> Option<f64> {
     env_settings().max_total_shares_per_market
+}
+
+fn imbalance_trim_settle_ms_from_env() -> u64 {
+    env_settings().imbalance_trim_settle_ms
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -234,6 +243,41 @@ impl ExecutionState {
         *entry += amount;
     }
 
+    fn trim_shares(&mut self, condition_id: &str, shares_to_trim: f64) {
+        if shares_to_trim <= 0.0 {
+            return;
+        }
+
+        let Some(current_shares) = self.shares_by_condition.get(condition_id).copied() else {
+            return;
+        };
+
+        let trim = shares_to_trim.min(current_shares);
+        let remaining_shares = (current_shares - trim).max(0.0);
+        if remaining_shares <= 0.0 {
+            self.shares_by_condition.remove(condition_id);
+            self.total_effective_cost_by_condition.remove(condition_id);
+            return;
+        }
+
+        let current_total_cost = self
+            .total_effective_cost_by_condition
+            .get(condition_id)
+            .copied()
+            .unwrap_or(0.0);
+        let avg_price = if current_shares > 0.0 {
+            current_total_cost / current_shares
+        } else {
+            0.0
+        };
+        let remaining_cost = (current_total_cost - (trim * avg_price)).max(0.0);
+
+        self.shares_by_condition
+            .insert(condition_id.to_string(), remaining_shares);
+        self.total_effective_cost_by_condition
+            .insert(condition_id.to_string(), remaining_cost);
+    }
+
     fn avg_price(&self, condition_id: &str) -> Option<f64> {
         let shares = *self.shares_by_condition.get(condition_id).unwrap_or(&0.0);
         if shares <= 0.0 {
@@ -260,6 +304,13 @@ struct RebalancePlan {
     side_condition_id: String,
     token_id: String,
     limit_price: f64,
+    shares: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ImbalanceTrimPlan {
+    side_condition_id: String,
+    token_id: String,
     shares: f64,
 }
 
@@ -480,6 +531,95 @@ impl Trader {
         })
     }
 
+    fn imbalance_trim_plan(
+        &self,
+        state: &ExecutionState,
+        opportunity: &ArbitrageOpportunity,
+    ) -> Option<ImbalanceTrimPlan> {
+        let eth_shares = state.total_eth_shares(&opportunity.eth_condition_id);
+        let btc_shares = state.total_btc_shares(&opportunity.btc_condition_id);
+        let imbalance = (eth_shares - btc_shares).abs();
+        let min_shares = min_shares_from_env();
+        if imbalance < min_shares {
+            return None;
+        }
+
+        let (side_condition_id, token_id, excess_shares) = if eth_shares > btc_shares {
+            (
+                opportunity.eth_condition_id.clone(),
+                opportunity.eth_up_token_id.clone(),
+                eth_shares - btc_shares,
+            )
+        } else {
+            (
+                opportunity.btc_condition_id.clone(),
+                opportunity.btc_down_token_id.clone(),
+                btc_shares - eth_shares,
+            )
+        };
+
+        let shares = excess_shares.floor();
+        if shares < min_shares {
+            return None;
+        }
+
+        Some(ImbalanceTrimPlan {
+            side_condition_id,
+            token_id,
+            shares,
+        })
+    }
+
+    async fn execute_trim_with_recheck(
+        &self,
+        executor: &ExecutorClient,
+        opportunity: &ArbitrageOpportunity,
+        initial_plan: ImbalanceTrimPlan,
+    ) -> Result<()> {
+        let settle_ms = imbalance_trim_settle_ms_from_env();
+        if settle_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+        }
+
+        let refreshed_plan = {
+            let state = self.execution_state.lock().await;
+            self.imbalance_trim_plan(&state, opportunity)
+        };
+
+        let Some(plan) = refreshed_plan else {
+            info!(
+                "✅ TRIM SKIP | pair={} reason=balanced_after_recheck",
+                opportunity.pair_label
+            );
+            return Ok(());
+        };
+
+        let trim_shares = plan.shares.min(initial_plan.shares);
+        if trim_shares < min_shares_from_env() {
+            info!(
+                "✅ TRIM SKIP | pair={} reason=below_min_after_recheck shares={:.2}",
+                opportunity.pair_label, trim_shares
+            );
+            return Ok(());
+        }
+
+        let resp = executor
+            .cashout_position(&plan.token_id, trim_shares)
+            .await?;
+        warn!(
+            "✂️ IMBALANCE TRIM executed | pair={} condition={} requested={:.2} order_id={:?} executor_requested={:?}",
+            opportunity.pair_label,
+            plan.side_condition_id,
+            trim_shares,
+            resp.order_id,
+            resp.requested_shares
+        );
+
+        let mut state = self.execution_state.lock().await;
+        state.trim_shares(&plan.side_condition_id, trim_shares);
+        Ok(())
+    }
+
     pub fn new(
         api: Arc<PolymarketClient>,
         clob: Option<Arc<ClobClient>>,
@@ -515,7 +655,7 @@ impl Trader {
         let trade_limit = per_direction_trade_limit_from_env();
         let balance = self.live_usdc_balance.lock().await.to_f64().unwrap_or(0.0);
 
-        let (direction_count, rebalance_plan) = {
+        let (direction_count, rebalance_plan, trim_plan) = {
             let mut state = self.execution_state.lock().await;
             state.reset_for_window(window_key);
 
@@ -532,8 +672,23 @@ impl Trader {
             );
 
             let plan = self.rebalance_plan(&state, opportunity, balance);
-            (direction_count, plan)
+            let trim_plan = self.imbalance_trim_plan(&state, opportunity);
+            (direction_count, plan, trim_plan)
         };
+
+        if let (Some(executor), Some(plan)) = (&self.executor, trim_plan) {
+            executor.healthcheck().await?;
+            info!(
+                "⚖️ IMBALANCE TRIM MODE | pair={} target_condition={} shares={:.2} settle_ms={}",
+                opportunity.pair_label,
+                plan.side_condition_id,
+                plan.shares,
+                imbalance_trim_settle_ms_from_env()
+            );
+            self.execute_trim_with_recheck(executor, opportunity, plan)
+                .await?;
+            return Ok(());
+        }
 
         let mut rebalance_only = false;
         let mut rebalance_target_condition = String::new();
