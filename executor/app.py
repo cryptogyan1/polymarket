@@ -83,6 +83,16 @@ class PositionResponse(BaseModel):
     shares: float
 
 
+class CancelOrderRequest(BaseModel):
+    order_id: str
+
+
+class CancelOrderResponse(BaseModel):
+    ok: bool
+    order_id: str
+    error: Optional[str] = None
+
+
 class TelegramNotificationRequest(BaseModel):
     type: str
     data: Dict[str, Any]
@@ -407,6 +417,16 @@ def position(token_id: str):
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/cancel", response_model=CancelOrderResponse)
+def cancel_order(req: CancelOrderRequest):
+    try:
+        CLIENT.cancel_orders([req.order_id])
+        return CancelOrderResponse(ok=True, order_id=req.order_id)
+    except Exception as exc:
+        traceback.print_exc()
+        return CancelOrderResponse(ok=False, order_id=req.order_id, error=str(exc))
 
 
 @app.post("/execute", response_model=ExecuteOrderResponse)

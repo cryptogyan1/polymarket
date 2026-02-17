@@ -63,6 +63,18 @@ pub struct PositionResponse {
     pub shares: f64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CancelOrderRequest {
+    pub order_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelOrderResponse {
+    pub ok: bool,
+    pub order_id: String,
+    pub error: Option<String>,
+}
+
 impl ExecutorClient {
     pub fn new(base_url: String) -> Result<Self> {
         let http = Client::builder()
@@ -193,6 +205,94 @@ impl ExecutorClient {
             self.base_url.trim_end_matches('/'),
             token_id
         );
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("failed to fetch token position from executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor position response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor rejected position query (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: PositionResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for position success response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor returned unsuccessful position query (status {}): token={}",
+                status,
+                parsed.token_id
+            ));
+        }
+
+        Ok(parsed.shares)
+    }
+
+    pub async fn cancel_order(&self, order_id: &str) -> Result<CancelOrderResponse> {
+        let url = format!("{}/cancel", self.base_url.trim_end_matches('/'));
+
+        let payload = CancelOrderRequest {
+            order_id: order_id.to_string(),
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send cancel intent to executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor cancel response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor rejected cancel intent (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: CancelOrderResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for cancel success response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor rejected cancel intent (status {}): {}",
+                status,
+                parsed.error.unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+
+        Ok(parsed)
+    }
 
         let resp = self
             .http

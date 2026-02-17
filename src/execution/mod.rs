@@ -39,6 +39,7 @@ struct ExecutionEnv {
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
     imbalance_trim_settle_ms: u64,
+    post_fill_verify_settle_ms: u64,
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -100,6 +101,10 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(800),
+        post_fill_verify_settle_ms: std::env::var("POST_FILL_VERIFY_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(400),
     }
 }
 
@@ -158,6 +163,10 @@ fn max_total_shares_per_market_from_env() -> Option<f64> {
 
 fn imbalance_trim_settle_ms_from_env() -> u64 {
     env_settings().imbalance_trim_settle_ms
+}
+
+fn post_fill_verify_settle_ms_from_env() -> u64 {
+    env_settings().post_fill_verify_settle_ms
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -803,6 +812,25 @@ impl Trader {
             if let Some((expired_token, expired_shares, expired_leg)) =
                 self.check_orphan_expiry(opportunity).await
             {
+                let pending_order_id = {
+                    let state = self.execution_state.lock().await;
+                    state
+                        .peek_orphaned_leg()
+                        .and_then(|o| o.pending_completion_order_id.clone())
+                };
+                if let Some(order_id) = pending_order_id {
+                    warn!(
+                        "🚫 Cancelling pending orphan-completion GTC before force-cashout | order_id={}",
+                        order_id
+                    );
+                    if let Err(cancel_err) = executor.cancel_order(&order_id).await {
+                        warn!(
+                            "⚠️ Failed to cancel pending orphan-completion GTC | order_id={} err={}",
+                            order_id, cancel_err
+                        );
+                    }
+                }
+
                 let safe_shares = (expired_shares * 0.999).max(0.0);
                 warn!(
                     "🧯 Force-cashing expired orphan | leg={} shares={:.4}",
@@ -1295,6 +1323,11 @@ impl Trader {
 
                 let (eth_result, btc_result) = tokio::join!(eth_future, btc_future);
 
+                let settle_ms = post_fill_verify_settle_ms_from_env();
+                if settle_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                }
+
                 match (eth_result, btc_result) {
                     (Ok(eth_ok), Ok(btc_ok)) => {
                         info!("✅ ETH leg accepted by executor: {:?}", eth_ok.order_id);
@@ -1391,7 +1424,6 @@ impl Trader {
                         }
                     }
                     (Ok(eth_ok), Err(e)) => {
-                        eth_resp = Some(eth_ok);
                         warn!(
                             "❌ BTC leg failed on paired attempt {}/{}: {}",
                             attempt, attempts, e
@@ -1421,18 +1453,90 @@ impl Trader {
                                     .await
                                 {
                                     Ok(resp) => {
-                                        info!(
-                                            "✅ BTC leg submitted via executor after bounded bump: {:?}",
-                                            resp.order_id
-                                        );
-                                        btc_resp = Some(resp);
-                                        break;
+                                        let btc_filled_after_bump = self
+                                            .verify_executor_fill(
+                                                executor,
+                                                &opportunity.btc_down_token_id,
+                                                size_shares,
+                                                pre_btc_shares,
+                                            )
+                                            .await
+                                            .unwrap_or_else(|verify_err| {
+                                                warn!(
+                                                    "⚠️ BTC bumped-price post-fill verification failed: {}",
+                                                    verify_err
+                                                );
+                                                false
+                                            });
+                                        if btc_filled_after_bump {
+                                            info!(
+                                                "✅ BTC leg verified filled after bounded bump: {:?}",
+                                                resp.order_id
+                                            );
+                                            let eth_filled = self
+                                                .verify_executor_fill(
+                                                    executor,
+                                                    &opportunity.eth_up_token_id,
+                                                    size_shares,
+                                                    pre_eth_shares,
+                                                )
+                                                .await
+                                                .unwrap_or_else(|verify_err| {
+                                                    warn!(
+                                                        "⚠️ ETH post-fill verification after BTC bump failed: {}",
+                                                        verify_err
+                                                    );
+                                                    false
+                                                });
+                                            if eth_filled {
+                                                eth_resp = Some(eth_ok);
+                                                btc_resp = Some(resp);
+                                                break;
+                                            }
+                                            warn!(
+                                                "⚠️ ETH not confirmed after BTC bumped fill; keeping failure path"
+                                            );
+                                        } else {
+                                            warn!(
+                                                "⚠️ BTC bumped-price order accepted but unfilled; keeping orphan recovery path"
+                                            );
+                                        }
                                     }
                                     Err(bumped_err) => {
                                         warn!("❌ BTC bumped-price retry failed: {}", bumped_err);
                                     }
                                 }
                             }
+                        }
+
+                        let eth_confirmed = self
+                            .verify_executor_fill(
+                                executor,
+                                &opportunity.eth_up_token_id,
+                                size_shares,
+                                pre_eth_shares,
+                            )
+                            .await
+                            .unwrap_or_else(|verify_err| {
+                                warn!(
+                                    "⚠️ ETH confirmation failed in one-leg path; treating as unconfirmed: {}",
+                                    verify_err
+                                );
+                                false
+                            });
+
+                        if !eth_confirmed {
+                            warn!(
+                                "⚠️ ETH leg returned Ok but fill unconfirmed; skipping orphan record on this attempt"
+                            );
+                            if attempt == attempts && !executor.allow_partial_arb() {
+                                return Err(anyhow!(
+                                    "second leg failed and first-leg fill was unconfirmed after {} attempts: {}",
+                                    attempts,
+                                    e
+                                ));
+                            }
+                            continue;
                         }
 
                         warn!(
@@ -1448,7 +1552,6 @@ impl Trader {
                             &Self::window_key(opportunity),
                         )
                         .await;
-                        eth_resp = None;
 
                         one_leg_incident = true;
                         if executor.allow_partial_arb() {
@@ -1463,12 +1566,43 @@ impl Trader {
                             e
                         ));
                     }
-                    (Err(e), Ok(_btc_ok)) => {
+                    (Err(e), Ok(btc_ok)) => {
                         warn!(
                             "❌ ETH leg failed on paired attempt {}/{}: {}",
                             attempt, attempts, e
                         );
 
+                        let btc_confirmed = self
+                            .verify_executor_fill(
+                                executor,
+                                &opportunity.btc_down_token_id,
+                                size_shares,
+                                pre_btc_shares,
+                            )
+                            .await
+                            .unwrap_or_else(|verify_err| {
+                                warn!(
+                                    "⚠️ BTC confirmation failed in one-leg path; treating as unconfirmed: {}",
+                                    verify_err
+                                );
+                                false
+                            });
+
+                        if !btc_confirmed {
+                            warn!(
+                                "⚠️ BTC leg returned Ok but fill unconfirmed; skipping orphan record on this attempt"
+                            );
+                            if attempt == attempts && !executor.allow_partial_arb() {
+                                return Err(anyhow!(
+                                    "first leg failed and second-leg fill was unconfirmed after {} attempts: {}",
+                                    attempts,
+                                    e
+                                ));
+                            }
+                            continue;
+                        }
+
+                        info!("✅ BTC leg accepted by executor: {:?}", btc_ok.order_id);
                         warn!(
                             "🔶 ONE-LEG FILL | BTC filled @ {:.4}, ETH failed. Recording orphan instead of cashout.",
                             opportunity.btc_down_price
