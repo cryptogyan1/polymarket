@@ -2,10 +2,9 @@ pub mod clob_client;
 pub mod errors;
 pub mod executor_client;
 pub mod orderbook;
-pub mod trader;
 
 use crate::client::PolymarketClient;
-use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConfig};
+use crate::config::{PositionSizing, TradeMode, TradingConfig, WalletConfig};
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
@@ -231,6 +230,8 @@ struct OrphanedLeg {
     pub recorded_at: u64,
     /// How many detection cycles we have waited so far.
     pub cycles_waited: u32,
+    /// Window key of the market pair where this orphan was created.
+    pub window_key: String,
 }
 
 #[derive(Debug, Default)]
@@ -246,6 +247,14 @@ struct ExecutionState {
 impl ExecutionState {
     fn reset_for_window(&mut self, window_key: String) {
         if self.active_window_key.as_ref() != Some(&window_key) {
+            if let Some(orphan) = self.orphaned_leg.take() {
+                warn!(
+                    "⚠️ Clearing orphan on window reset without recovery | old_window={} leg={} token={}",
+                    orphan.window_key,
+                    orphan.leg,
+                    &orphan.token_id[..12.min(orphan.token_id.len())],
+                );
+            }
             self.active_window_key = Some(window_key);
             self.trade_count_by_direction.clear();
             self.shares_by_condition.clear();
@@ -337,12 +346,14 @@ impl ExecutionState {
     fn record_orphaned_leg(&mut self, orphan: OrphanedLeg) {
         if self.orphaned_leg.is_some() {
             warn!(
-                "⚠️  ORPHAN OVERWRITE | previous orphan discarded; new orphan leg={}",
+                "⚠️  ORPHAN EXISTS | keeping existing orphan, ignoring new orphan leg={}",
                 orphan.leg
             );
+            return;
         }
         warn!(
-            "🔶 ORPHANED LEG RECORDED | leg={} token={} shares={:.2} entry_price={:.4}",
+            "🔶 ORPHANED LEG RECORDED | window={} leg={} token={} shares={:.2} entry_price={:.4}",
+            orphan.window_key,
             orphan.leg,
             &orphan.token_id[..12.min(orphan.token_id.len())],
             orphan.shares,
@@ -448,6 +459,7 @@ impl Trader {
         shares: f64,
         entry_price: f64,
         leg: &'static str,
+        window_key: &str,
     ) {
         let orphan = OrphanedLeg {
             leg,
@@ -457,6 +469,7 @@ impl Trader {
             entry_price,
             recorded_at: now_ts(),
             cycles_waited: 0,
+            window_key: window_key.to_string(),
         };
         let mut state = self.execution_state.lock().await;
         state.record_orphaned_leg(orphan);
@@ -470,6 +483,15 @@ impl Trader {
     ) -> Option<(String, f64, &'static str)> {
         let state = self.execution_state.lock().await;
         let orphan = state.peek_orphaned_leg()?;
+
+        let current_window = Self::window_key(opportunity);
+        if orphan.window_key != current_window {
+            warn!(
+                "⏰ ORPHAN WINDOW MISMATCH | orphan_window={} current_window={} leg={} → force cashout",
+                orphan.window_key, current_window, orphan.leg
+            );
+            return Some((orphan.token_id.clone(), orphan.shares, orphan.leg));
+        }
 
         if orphan.cycles_waited >= orphaned_leg_max_cycles() {
             warn!(
@@ -755,6 +777,10 @@ impl Trader {
         // the pair here instead of entering a whole new position.
         // ─────────────────────────────────────────────────────────────────────
         if let Some(executor) = self.executor.as_ref() {
+            {
+                let mut state = self.execution_state.lock().await;
+                state.tick_orphaned_cycles();
+            }
             if let Some((expired_token, expired_shares, expired_leg)) =
                 self.check_orphan_expiry(opportunity).await
             {
@@ -770,8 +796,7 @@ impl Trader {
                 state.take_orphaned_leg();
             } else {
                 let orphan_snapshot = {
-                    let mut state = self.execution_state.lock().await;
-                    state.tick_orphaned_cycles();
+                    let state = self.execution_state.lock().await;
                     state.peek_orphaned_leg().cloned()
                 };
 
@@ -1082,15 +1107,6 @@ impl Trader {
             );
         }
 
-        let min_total_spend = Config::min_trade_size();
-        if spend < min_total_spend {
-            warn!(
-                "❌ Trade skipped (below minimum total spend ${:.2})",
-                min_total_spend
-            );
-            return Ok(());
-        }
-
         if !rebalance_only {
             let state = self.execution_state.lock().await;
             if let Err(err) = Self::can_open_paired_position(&state, opportunity, units) {
@@ -1280,6 +1296,7 @@ impl Trader {
                             size_shares,
                             opportunity.eth_up_price.to_f64().unwrap_or_default(),
                             "ETH",
+                            &Self::window_key(opportunity),
                         )
                         .await;
                         eth_resp = None;
@@ -1313,6 +1330,7 @@ impl Trader {
                             size_shares,
                             opportunity.btc_down_price.to_f64().unwrap_or_default(),
                             "BTC",
+                            &Self::window_key(opportunity),
                         )
                         .await;
                         btc_resp = None;
