@@ -4,7 +4,8 @@ import os
 import threading
 import re
 import traceback
-from math import floor
+from math import ceil, floor
+import time
 from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -46,6 +47,9 @@ MIN_SHARES = float(os.getenv("MIN_SHARES", "5"))
 MAX_SHARES_RAW = os.getenv("MAX_SHARES", "").strip()
 MAX_SHARES = float(MAX_SHARES_RAW) if MAX_SHARES_RAW else None
 STRICT_SHARE_BOUNDS = os.getenv("STRICT_SHARE_BOUNDS", "true").strip().lower() == "true"
+MIN_MARKETABLE_BUY_USDC = float(os.getenv("MIN_MARKETABLE_BUY_USDC", "1"))
+CREATE_ORDER_RETRY_ATTEMPTS = max(1, int(os.getenv("CREATE_ORDER_RETRY_ATTEMPTS", "2")))
+CREATE_ORDER_RETRY_DELAY_MS = max(0, int(os.getenv("CREATE_ORDER_RETRY_DELAY_MS", "250")))
 
 app = FastAPI(title="polymarket-executor", version="1.0.4")
 
@@ -88,7 +92,7 @@ class TelegramNotificationResponse(BaseModel):
     message_id: Optional[int] = None
 
 
-def clamp_order_size(raw_size: float, side: int) -> float:
+def clamp_order_size(raw_size: float, side: int, price: Optional[float] = None) -> float:
     """Clamp buy size with strict env bounds; keep sell size flexible for emergency exits."""
     size = float(raw_size)
 
@@ -99,11 +103,18 @@ def clamp_order_size(raw_size: float, side: int) -> float:
 
     size = float(floor(size))
 
+    if side == BUY and price is not None and price > 0 and MIN_MARKETABLE_BUY_USDC > 0:
+        min_notional_shares = float(ceil(MIN_MARKETABLE_BUY_USDC / price))
+        if min_notional_shares > size:
+            size = min_notional_shares
+
     if MAX_SHARES is not None:
         if STRICT_SHARE_BOUNDS and abs(MAX_SHARES - MIN_SHARES) < 1e-9:
             if abs(size - MAX_SHARES) > 1e-9:
                 raise ValueError(
-                    f"strict fixed shares enabled for BUY: requested={size:.2f}, required exactly={MAX_SHARES:.2f}"
+                    "strict fixed shares enabled for BUY: "
+                    f"required exactly={MAX_SHARES:.2f}, "
+                    f"but {size:.2f} shares are needed to satisfy minimum notional ${MIN_MARKETABLE_BUY_USDC:.2f}"
                 )
             return MAX_SHARES
 
@@ -213,6 +224,36 @@ def resolve_fee_rate_bps(market_fee_bps: Optional[int] = None) -> Optional[int]:
             print(f"[executor] invalid EXECUTOR_FEE_BPS='{FEE_BPS_OVERRIDE}', ignoring override")
 
     return market_fee_bps
+
+
+def is_transient_clob_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "server disconnected" in message
+        or "request exception" in message
+        or "remoteprotocolerror" in message
+        or "timed out" in message
+    )
+
+
+def create_order_with_retry(order_args: OrderArgs):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, CREATE_ORDER_RETRY_ATTEMPTS + 1):
+        try:
+            return CLIENT.create_order(order_args)
+        except Exception as exc:
+            last_exc = exc
+            if not is_transient_clob_error(exc) or attempt >= CREATE_ORDER_RETRY_ATTEMPTS:
+                raise
+            wait_s = CREATE_ORDER_RETRY_DELAY_MS / 1000.0
+            print(
+                f"[executor] transient create_order failure (attempt {attempt}/{CREATE_ORDER_RETRY_ATTEMPTS}): {exc}. "
+                f"retrying in {wait_s:.3f}s"
+            )
+            time.sleep(wait_s)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("create_order_with_retry exhausted without error or result")
 
 def init_client() -> ClobClient:
     private_key, funder = resolve_funder_address(PRIVATE_KEY, PROXY_WALLET)
@@ -397,7 +438,7 @@ def health():
 def execute(req: ExecuteOrderRequest):
     try:
         side = BUY if req.side == "BUY" else SELL
-        clamped_size = clamp_order_size(req.size_usdc, side)
+        clamped_size = clamp_order_size(req.size_usdc, side, req.price)
         order_args = build_order_args(
             token_id=req.token_id,
             side=side,
@@ -408,7 +449,7 @@ def execute(req: ExecuteOrderRequest):
         )
 
         try:
-            signed = CLIENT.create_order(order_args)
+            signed = create_order_with_retry(order_args)
             result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
         except Exception as exc:
             market_fee_bps = extract_market_fee_bps(exc)
@@ -428,7 +469,7 @@ def execute(req: ExecuteOrderRequest):
                 fok=req.fok,
                 fee_rate_bps=effective_fee_bps,
             )
-            signed = CLIENT.create_order(retry_args)
+            signed = create_order_with_retry(retry_args)
             result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
 
         order_id = None
