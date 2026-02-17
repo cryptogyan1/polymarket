@@ -14,7 +14,6 @@ pub struct ExecutorClient {
     allow_partial_arb: bool,
 }
 
-
 #[derive(Debug, Serialize)]
 pub struct TelegramNotifyRequest {
     pub r#type: String,
@@ -55,6 +54,13 @@ pub struct CashoutResponse {
     pub requested_shares: Option<f64>,
     pub order_id: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PositionResponse {
+    pub ok: bool,
+    pub token_id: String,
+    pub shares: f64,
 }
 
 impl ExecutorClient {
@@ -181,7 +187,52 @@ impl ExecutorClient {
         Ok(parsed)
     }
 
+    pub async fn get_token_shares(&self, token_id: &str) -> Result<f64> {
+        let url = format!(
+            "{}/position/{}",
+            self.base_url.trim_end_matches('/'),
+            token_id
+        );
 
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("failed to fetch token position from executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor position response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor rejected position query (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: PositionResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for position success response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor returned unsuccessful position query (status {}): token={}",
+                status,
+                parsed.token_id
+            ));
+        }
+
+        Ok(parsed.shares)
+    }
     pub async fn notify_trade_success(
         &self,
         direction: &str,

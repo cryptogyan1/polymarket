@@ -424,6 +424,17 @@ impl Trader {
         state.add_effective_cost(condition_id, shares * effective_price_per_share);
     }
 
+    async fn verify_executor_fill(
+        &self,
+        executor: &ExecutorClient,
+        token_id: &str,
+        expected_shares: f64,
+    ) -> Result<bool> {
+        let observed = executor.get_token_shares(token_id).await?;
+        let min_expected = (expected_shares * 0.98).max(expected_shares - 1.0);
+        Ok(observed + f64::EPSILON >= min_expected)
+    }
+
     fn can_open_paired_position(
         state: &ExecutionState,
         opportunity: &ArbitrageOpportunity,
@@ -1209,37 +1220,96 @@ impl Trader {
 
                 match (eth_result, btc_result) {
                     (Ok(eth_ok), Ok(btc_ok)) => {
-                        info!("✅ ETH leg submitted via executor: {:?}", eth_ok.order_id);
-                        info!("✅ BTC leg submitted via executor: {:?}", btc_ok.order_id);
+                        info!("✅ ETH leg accepted by executor: {:?}", eth_ok.order_id);
+                        info!("✅ BTC leg accepted by executor: {:?}", btc_ok.order_id);
 
-                        let combined_price = opportunity.total_cost.to_f64().unwrap_or_default();
-                        let target_price =
-                            arbitrage_max_sum_from_env() + arbitrage_sum_tolerance_from_env();
-
-                        if let Err(notify_err) = executor
-                            .notify_trade_success(
-                                &opportunity.pair_label,
+                        let eth_filled = self
+                            .verify_executor_fill(
+                                executor,
                                 &opportunity.eth_up_token_id,
-                                opportunity.eth_up_price.to_f64().unwrap_or_default(),
-                                eth_ok.order_id.as_deref(),
-                                &opportunity.btc_down_token_id,
-                                opportunity.btc_down_price.to_f64().unwrap_or_default(),
-                                btc_ok.order_id.as_deref(),
-                                spend,
-                                combined_price,
-                                target_price,
+                                size_shares,
                             )
                             .await
-                        {
-                            warn!(
-                                "⚠️ failed to send executor trade notification: {}",
-                                notify_err
-                            );
+                            .unwrap_or_else(|e| {
+                                warn!("⚠️ ETH post-fill verification failed: {}", e);
+                                false
+                            });
+                        let btc_filled = self
+                            .verify_executor_fill(
+                                executor,
+                                &opportunity.btc_down_token_id,
+                                size_shares,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                warn!("⚠️ BTC post-fill verification failed: {}", e);
+                                false
+                            });
+
+                        if eth_filled && btc_filled {
+                            let combined_price =
+                                opportunity.total_cost.to_f64().unwrap_or_default();
+                            let target_price =
+                                arbitrage_max_sum_from_env() + arbitrage_sum_tolerance_from_env();
+
+                            if let Err(notify_err) = executor
+                                .notify_trade_success(
+                                    &opportunity.pair_label,
+                                    &opportunity.eth_up_token_id,
+                                    opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                    eth_ok.order_id.as_deref(),
+                                    &opportunity.btc_down_token_id,
+                                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                    btc_ok.order_id.as_deref(),
+                                    spend,
+                                    combined_price,
+                                    target_price,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "⚠️ failed to send executor trade notification: {}",
+                                    notify_err
+                                );
+                            }
+
+                            eth_resp = Some(eth_ok);
+                            btc_resp = Some(btc_ok);
+                            break;
                         }
 
-                        eth_resp = Some(eth_ok);
-                        btc_resp = Some(btc_ok);
-                        break;
+                        warn!(
+                            "⚠️ POST-FILL VERIFY FAILED | eth_filled={} btc_filled={} shares={:.2}",
+                            eth_filled, btc_filled, size_shares
+                        );
+
+                        if eth_filled && !btc_filled {
+                            self.record_orphan_instead_of_unwind(
+                                &opportunity.eth_up_token_id,
+                                &opportunity.eth_condition_id,
+                                size_shares,
+                                opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                "ETH",
+                                &Self::window_key(opportunity),
+                            )
+                            .await;
+                            one_leg_incident = true;
+                            break;
+                        }
+
+                        if btc_filled && !eth_filled {
+                            self.record_orphan_instead_of_unwind(
+                                &opportunity.btc_down_token_id,
+                                &opportunity.btc_condition_id,
+                                size_shares,
+                                opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                "BTC",
+                                &Self::window_key(opportunity),
+                            )
+                            .await;
+                            one_leg_incident = true;
+                            break;
+                        }
                     }
                     (Ok(eth_ok), Err(e)) => {
                         eth_resp = Some(eth_ok);

@@ -77,6 +77,12 @@ class CashoutResponse(BaseModel):
     error: Optional[str] = None
 
 
+class PositionResponse(BaseModel):
+    ok: bool
+    token_id: str
+    shares: float
+
+
 class TelegramNotificationRequest(BaseModel):
     type: str
     data: Dict[str, Any]
@@ -391,6 +397,16 @@ async def shutdown_event():
 @app.get("/health")
 def health():
     return {"ok": True, "mode": "execution-only"}
+
+
+@app.get("/position/{token_id}", response_model=PositionResponse)
+def position(token_id: str):
+    try:
+        shares = float(GUARD.get_token_shares(token_id))
+        return PositionResponse(ok=True, token_id=token_id, shares=shares)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/execute", response_model=ExecuteOrderResponse)
