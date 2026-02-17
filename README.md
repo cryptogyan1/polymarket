@@ -57,8 +57,10 @@ EXECUTION_MODE=executor
 EXECUTOR_URL=http://127.0.0.1:8787
 # optional override: 0 (EOA) / 2 (proxy wallet)
 POLY_SIGNATURE_TYPE=2
-# optional: Fill-Or-Kill execution in executor mode
+# optional: Fill-Or-Kill default execution behavior in executor mode
 FOK=false
+# optional: BUY-only Fill-Or-Kill override (falls back to FOK when unset)
+FOK_BUY=false
 # pair selection (enable exactly one)
 PAIR_BTC_ETH=true
 PAIR_BTC_SOL=false
@@ -171,6 +173,7 @@ Each candidate must satisfy:
 - `sum(ask_prices) < ARBITRAGE_MAX_SUM`
 - `max_shares_at_ask >= MIN_SHARES` where `max_shares_at_ask = min(ETH_ask_size, BTC_ask_size)`
 - execution buys equal shares on both legs, additionally capped by optional `MAX_SHARES`.
+- after bounds/caps are applied, bot picks a random whole share count in `[MIN_SHARES, effective_max]` and uses that exact share count on both legs.
 
 - strict fixed share mode is enforced when `STRICT_SHARE_BOUNDS=true` and `MIN_SHARES == MAX_SHARES`:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
@@ -182,6 +185,8 @@ Each candidate must satisfy:
   - bot rejects startup if none or multiple toggles are enabled
 
 - one-leg fail-safe unwind in executor mode:
+  - BUY leg submissions can be controlled independently with `FOK_BUY` while `FOK` remains available for other executor order flows
+  - when `FOK_BUY=true`, Rust preflight now requires enough cumulative ask depth at or below each BUY limit price before attempting paired submission
   - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures
 
 - Telegram manual control bot (`executor/telegram_control_bot.py`):
