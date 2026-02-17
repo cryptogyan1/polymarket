@@ -395,6 +395,9 @@ def health():
 
 @app.post("/execute", response_model=ExecuteOrderResponse)
 def execute(req: ExecuteOrderRequest):
+    # ⚠️ DO NOT add a "$1 minimum" validation here.
+    # Polymarket accepts sub-$1 notional orders; the only floor we enforce is
+    # MIN_SHARES in clamp_order_size. Rejecting cheap legs creates one-leg fills.
     try:
         side = BUY if req.side == "BUY" else SELL
         clamped_size = clamp_order_size(req.size_usdc, side)
