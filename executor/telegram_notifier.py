@@ -108,7 +108,7 @@ Direction: {direction}
 ━━━━━━━━━━━━━━━━━━━━━
 💵 Total Cost: ${trade.total_cost:.2f} USDC
 📈 Combined Price: {trade.combined_price:.3f}
-🎯 Target: < {trade.target_price:.3f}
+🎯 Target: &lt; {trade.target_price:.3f}
 ✨ Profit Potential: ~${profit_value:.2f} ({profit_pct:.2f}%)
 ⏱️ Execution Time: {(trade.execution_time_seconds or 0.0):.1f}s
 """

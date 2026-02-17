@@ -14,6 +14,36 @@ A frequent 401 root cause is bad/mismatched CLOB auth header generation. In this
 
 ## Quick start
 
+## WSL prerequisites (recommended)
+
+On Ubuntu WSL, install the common build/runtime dependencies first:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential pkg-config libssl-dev curl git ca-certificates \
+  python3 python3-venv python3-pip ripgrep
+```
+
+Then ensure Rust is usable in the current shell:
+
+```bash
+# if rustup is already installed, this is enough
+source "$HOME/.cargo/env"
+
+# optional: install rustup only if missing
+command -v rustup >/dev/null 2>&1 || curl https://sh.rustup.rs -sSf | sh -s -- -y
+rustup default stable
+```
+
+> Note: if distro Rust already exists under `/usr/bin`, rustup may warn during install. That warning is safe as long as `cargo --version` and `rustc --version` work after `source ~/.cargo/env`.
+
+Environment quick-check (without ripgrep dependency):
+
+```bash
+grep -E 'TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|PROXY_WALLET|PRIVATE_KEY|TELEGRAM_CONTROL_RPC_URL|POLYGON_RPC_URL' .env
+```
+
 1. Configure `.env` with at least:
 
 ```env
