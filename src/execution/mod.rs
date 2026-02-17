@@ -376,7 +376,6 @@ impl Trader {
         &self,
         executor: &ExecutorClient,
         token_id: &str,
-        _fallback_bid_price: f64,
         size_shares: f64,
         leg_label: &str,
     ) -> Result<()> {
@@ -388,27 +387,47 @@ impl Trader {
             ));
         }
 
-        // Allow short settlement window so balance snapshots catch up before unwind.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let retry_delays_ms = [0_u64, imbalance_trim_settle_ms_from_env(), 300_u64];
+        let mut last_err: Option<anyhow::Error> = None;
 
-        // Do not apply an extra haircut here — executor/position_guard already applies
-        // safety margins and retries based on live balance snapshots.
-        let unwind_shares = size_shares;
+        for (idx, delay_ms) in retry_delays_ms.iter().enumerate() {
+            if *delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            }
 
-        let resp = executor
-            .cashout_position(token_id, unwind_shares)
-            .await
-            .with_context(|| format!("failed to cashout {} leg", leg_label))?;
+            match executor.cashout_position(token_id, size_shares).await {
+                Ok(resp) => {
+                    warn!(
+                        "🧯 Emergency unwind executed via cashout | leg={} attempt={} order_id={:?} requested_shares={:.4} executor_requested_shares={:?}",
+                        leg_label,
+                        idx + 1,
+                        resp.order_id,
+                        size_shares,
+                        resp.requested_shares
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        "❌ Emergency unwind attempt failed | leg={} attempt={} delay_ms={} error={}",
+                        leg_label,
+                        idx + 1,
+                        delay_ms,
+                        err
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
 
-        warn!(
-            "🧯 Emergency unwind executed via cashout | leg={} order_id={:?} requested_shares={:.4} executor_requested_shares={:?}",
+        Err(anyhow!(
+            "failed to cashout {} leg after {} attempts: {}",
             leg_label,
-            resp.order_id,
-            unwind_shares,
-            resp.requested_shares
-        );
-
-        Ok(())
+            retry_delays_ms.len(),
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
     fn rebalance_plan(
@@ -1063,19 +1082,26 @@ impl Trader {
                             }
                         }
 
-                        let unwind_price = opportunity.eth_up_bid_price.to_f64().unwrap_or(0.0);
                         if let Err(unwind_err) = self
                             .emergency_unwind(
                                 executor,
                                 &opportunity.eth_up_token_id,
-                                unwind_price,
                                 size_shares,
                                 "ETH",
                             )
                             .await
                         {
+                            let mut state = self.execution_state.lock().await;
+                            Self::update_filled_state(
+                                &mut state,
+                                &opportunity.eth_condition_id,
+                                units,
+                                effective_buy_price(
+                                    opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                ),
+                            );
                             return Err(anyhow!(
-                                "second leg failed and immediate ETH unwind failed. second_leg_error: {}; unwind_error: {}",
+                                "second leg failed and ETH unwind failed after retries; tracked ETH as open residual. second_leg_error: {}; unwind_error: {}",
                                 e,
                                 unwind_err
                             ));
@@ -1101,19 +1127,26 @@ impl Trader {
                             attempt, attempts, e
                         );
 
-                        let unwind_price = opportunity.btc_down_bid_price.to_f64().unwrap_or(0.0);
                         if let Err(unwind_err) = self
                             .emergency_unwind(
                                 executor,
                                 &opportunity.btc_down_token_id,
-                                unwind_price,
                                 size_shares,
                                 "BTC",
                             )
                             .await
                         {
+                            let mut state = self.execution_state.lock().await;
+                            Self::update_filled_state(
+                                &mut state,
+                                &opportunity.btc_condition_id,
+                                units,
+                                effective_buy_price(
+                                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                ),
+                            );
                             return Err(anyhow!(
-                                "first leg failed and immediate BTC unwind failed. first_leg_error: {}; unwind_error: {}",
+                                "first leg failed and BTC unwind failed after retries; tracked BTC as open residual. first_leg_error: {}; unwind_error: {}",
                                 e,
                                 unwind_err
                             ));
