@@ -91,7 +91,7 @@ class TelegramNotificationResponse(BaseModel):
     message_id: Optional[int] = None
 
 
-def clamp_order_size(raw_size: float, side: int) -> float:
+def clamp_order_size(raw_size: float, side: int, price: Optional[float] = None) -> float:
     """Clamp buy size with strict env bounds; keep sell size flexible for emergency exits."""
     size = float(raw_size)
 
@@ -102,11 +102,18 @@ def clamp_order_size(raw_size: float, side: int) -> float:
 
     size = float(floor(size))
 
+    if side == BUY and price is not None and price > 0 and MIN_MARKETABLE_BUY_USDC > 0:
+        min_notional_shares = float(ceil(MIN_MARKETABLE_BUY_USDC / price))
+        if min_notional_shares > size:
+            size = min_notional_shares
+
     if MAX_SHARES is not None:
         if STRICT_SHARE_BOUNDS and abs(MAX_SHARES - MIN_SHARES) < 1e-9:
             if abs(size - MAX_SHARES) > 1e-9:
                 raise ValueError(
-                    f"strict fixed shares enabled for BUY: requested={size:.2f}, required exactly={MAX_SHARES:.2f}"
+                    "strict fixed shares enabled for BUY: "
+                    f"required exactly={MAX_SHARES:.2f}, "
+                    f"but {size:.2f} shares are needed to satisfy minimum notional ${MIN_MARKETABLE_BUY_USDC:.2f}"
                 )
             return MAX_SHARES
 
@@ -430,7 +437,7 @@ def health():
 def execute(req: ExecuteOrderRequest):
     try:
         side = BUY if req.side == "BUY" else SELL
-        clamped_size = clamp_order_size(req.size_usdc, side)
+        clamped_size = clamp_order_size(req.size_usdc, side, req.price)
         order_args = build_order_args(
             token_id=req.token_id,
             side=side,
