@@ -157,10 +157,14 @@ Notes:
 - and ensures at least 5 shares to satisfy Polymarket limit-order constraints.
 
 
+### Strategy defaults (example `.env` values)
+
+```env
 ARBITRAGE_MAX_SUM=0.985
 MIN_SHARES=5
 MAX_SHARES=25
 STRICT_SHARE_BOUNDS=true
+```
 
 
 Strategy pair logic (only these two combinations are considered):
@@ -235,4 +239,3 @@ If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
 - avoid surrounding quotes/spaces in env values,
 - verify it is Polygon mainnet (`chainId=137`),
 - optionally set `POLYGON_RPC_URL` as an additional fallback.
-
