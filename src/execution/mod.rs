@@ -43,6 +43,7 @@ struct ExecutionEnv {
     imbalance_trim_settle_ms_retry: u64,
     paired_execution_mode: PairedExecutionMode,
     tiered_parallel_ratio_threshold: f64,
+    max_signal_age_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +149,10 @@ fn load_execution_env() -> ExecutionEnv {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.8)
             .clamp(0.0, 1.0),
+        max_signal_age_ms: std::env::var("MAX_SIGNAL_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(800),
     }
 }
 
@@ -218,6 +223,10 @@ fn paired_execution_mode_from_env() -> PairedExecutionMode {
 
 fn tiered_parallel_ratio_threshold_from_env() -> f64 {
     env_settings().tiered_parallel_ratio_threshold
+}
+
+fn max_signal_age_ms_from_env() -> u128 {
+    env_settings().max_signal_age_ms
 }
 
 fn balance_cache_ttl_seconds_from_env() -> u64 {
@@ -768,10 +777,7 @@ impl Trader {
     }
 
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
-        let max_signal_age_ms = std::env::var("MAX_SIGNAL_AGE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u128>().ok())
-            .unwrap_or(800);
+        let max_signal_age_ms = max_signal_age_ms_from_env();
         let signal_age_ms = opportunity.detected_at.elapsed().as_millis();
         if signal_age_ms > max_signal_age_ms {
             warn!(

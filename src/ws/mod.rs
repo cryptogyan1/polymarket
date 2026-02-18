@@ -374,6 +374,16 @@ async fn handle_value(v: &Value, cache: &PriceCache, tx: &broadcast::Sender<Book
             let best_bid = Decimal::from_str(&ev.best_bid).ok();
             let best_ask = Decimal::from_str(&ev.best_ask).ok();
 
+            if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+                cache
+                    .update(
+                        &ev.asset_id,
+                        vec![(bid, Decimal::ONE)],
+                        vec![(ask, Decimal::ONE)],
+                    )
+                    .await;
+            }
+
             debug!(
                 "⚡ best_bid_ask {}…  bid={} ask={}",
                 &ev.asset_id[..ev.asset_id.len().min(20)],
