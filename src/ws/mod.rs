@@ -205,7 +205,7 @@ async fn handle_message(txt: &str, cache: &PriceCache, tx: &broadcast::Sender<Bo
         Ok(v) => v,
         Err(e) => {
             warn!(
-                "WS JSON parse error: {} | raw={}",
+                "WS JSON parse error: {} | raw= {}",
                 e,
                 &txt[..txt.len().min(120)]
             );
@@ -214,13 +214,35 @@ async fn handle_message(txt: &str, cache: &PriceCache, tx: &broadcast::Sender<Bo
     };
 
     // ══════════════════════════════════════════════════════════════════════════
+    // ROOT CAUSE FIX: Polymarket sends the initial book snapshots as a JSON ARRAY:
+    //   [{"event_type":"book","asset_id":...,"bids":[...],"asks":[...]}, ...]
+    //
+    // v.get("event_type") on an array returns None → early return → snapshot
+    // silently dropped → cache empty forever → every price_change also skipped.
+    //
+    // Fix: detect array, iterate each element through handle_value().
+    // ══════════════════════════════════════════════════════════════════════════
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            handle_value(item, cache, tx).await;
+        }
+        return;
+    }
+
+    handle_value(&v, cache, tx).await;
+}
+
+// Processes a single JSON object with an "event_type" field.
+// Called both directly (plain object messages) and from the array unwrapper above.
+async fn handle_value(v: &Value, cache: &PriceCache, tx: &broadcast::Sender<BookUpdate>) {
+    // ══════════════════════════════════════════════════════════════════════════
     // MARKET CHANNEL messages use "event_type" (NOT "type").
     // "type" is only used in the subscription message we SEND.
     // ══════════════════════════════════════════════════════════════════════════
     let event_type = match v.get("event_type").and_then(Value::as_str) {
         Some(t) => t,
         None => {
-            debug!("WS msg no event_type: {}", &txt[..txt.len().min(120)]);
+            debug!("WS msg no event_type (skipped)");
             return;
         }
     };
@@ -229,14 +251,10 @@ async fn handle_message(txt: &str, cache: &PriceCache, tx: &broadcast::Sender<Bo
         // ── Full orderbook snapshot ────────────────────────────────────────
         // Emitted: on first subscribe + after each trade that changes the book
         "book" => {
-            let ev: WsBookEvent = match serde_json::from_value(v) {
+            let ev: WsBookEvent = match serde_json::from_value(v.clone()) {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(
-                        "Failed to parse 'book' event: {} | {}",
-                        e,
-                        &txt[..txt.len().min(200)]
-                    );
+                    warn!("Failed to parse 'book' event: {}", e);
                     return;
                 }
             };
@@ -275,11 +293,7 @@ async fn handle_message(txt: &str, cache: &PriceCache, tx: &broadcast::Sender<Bo
             let ev: WsPriceChangeEvent = match serde_json::from_value(v.clone()) {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(
-                        "Failed to parse price_change: {} | {}",
-                        e,
-                        &txt[..txt.len().min(200)]
-                    );
+                    warn!("Failed to parse price_change: {}", e);
                     return;
                 }
             };
@@ -352,7 +366,7 @@ async fn handle_message(txt: &str, cache: &PriceCache, tx: &broadcast::Sender<Bo
         // Fastest possible arb detection — no book parsing needed at all.
         // We get best_bid and best_ask directly in the message.
         "best_bid_ask" => {
-            let ev: WsBestBidAsk = match serde_json::from_value(v) {
+            let ev: WsBestBidAsk = match serde_json::from_value(v.clone()) {
                 Ok(e) => e,
                 Err(_) => return,
             };
@@ -425,11 +439,7 @@ async fn handle_message(txt: &str, cache: &PriceCache, tx: &broadcast::Sender<Bo
         "tick_size_change" => debug!("WS: tick_size_change event (ignored)"),
 
         other => {
-            debug!(
-                "WS event_type='{}' — ignored | {}",
-                other,
-                &txt[..txt.len().min(80)]
-            );
+            debug!("WS event_type='{}' — ignored", other);
         }
     }
 }
