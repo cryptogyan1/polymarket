@@ -43,7 +43,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PROXY_WALLET = os.getenv("PROXY_WALLET", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
-TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", "")
+CLAIM_WALLET = os.getenv("CLAIM_WALLET", "")
+CLAIM_PRIVATE_KEY = os.getenv("CLAIM_PRIVATE_KEY", "")
+TELEGRAM_CONTROL_RPC_URL = os.getenv("TELEGRAM_CONTROL_RPC_URL", os.getenv("RPC_URL", ""))
 
 
 def _clean_env(name: str) -> str:
@@ -387,6 +389,27 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
     if not private_key:
         raise RuntimeError("PRIVATE_KEY is required for CLAIM")
 
+    try:
+        signer_addr = Web3().eth.account.from_key(private_key).address
+    except Exception as exc:
+        raise RuntimeError(f"invalid PRIVATE_KEY for CLAIM: {exc}") from exc
+
+    if wallet and signer_addr.lower() != wallet.lower():
+        raise RuntimeError(
+            "CLAIM signer does not match wallet holding positions. "
+            f"signer={signer_addr} wallet={wallet}. "
+            "redeemPositions must be sent by the same address that owns the conditional tokens. "
+            "Set CLAIM_PRIVATE_KEY for that wallet (or make CLAIM_WALLET/PROXY_WALLET match signer)."
+        )
+
+    positions = fetch_open_positions(wallet)
+    settled_conditions = sorted(
+        {p.condition_id for p in positions if p.condition_id and p.resolved}
+    )
+
+    if not settled_conditions:
+        return []
+
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
     try:
         connected = w3.is_connected()
@@ -586,9 +609,9 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Unauthorized chat")
         return
 
-    wallet = _resolve_control_wallet()
+    wallet = (_clean_env("CLAIM_WALLET") or CLAIM_WALLET) or (_clean_env("PROXY_WALLET") or PROXY_WALLET) or CLIENT.get_address()
     rpc_url = _resolve_rpc_url() or TELEGRAM_CONTROL_RPC_URL
-    private_key = _clean_env("PRIVATE_KEY") or PRIVATE_KEY
+    private_key = (_clean_env("CLAIM_PRIVATE_KEY") or CLAIM_PRIVATE_KEY) or (_clean_env("PRIVATE_KEY") or PRIVATE_KEY)
 
     try:
         tx_hashes = await asyncio.to_thread(

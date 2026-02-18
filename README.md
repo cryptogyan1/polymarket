@@ -234,8 +234,20 @@ python -m executor.telegram_control_bot
 Requires env vars: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PROXY_WALLET`, `PRIVATE_KEY`.
 `CLAIM` also requires `TELEGRAM_CONTROL_RPC_URL` (or `POLYGON_RPC_URL`).
 
+For delegated/proxy setups, `CLAIM` can use a different wallet/key pair:
+- `CLAIM_WALLET` (optional): wallet whose positions should be redeemed
+- `CLAIM_PRIVATE_KEY` (optional): signer for claim txs (takes precedence over `PRIVATE_KEY`)
+
+`redeemPositions` must be sent by the same address that owns the conditional tokens.
+
 If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
 - ensure the value is a full HTTPS endpoint (include `https://`),
 - avoid surrounding quotes/spaces in env values,
 - verify it is Polygon mainnet (`chainId=137`),
 - optionally set `POLYGON_RPC_URL` as an additional fallback.
+
+If you see signer/wallet mismatch while claim txs are submitted but nothing is redeemed:
+- set `CLAIM_WALLET` to the exact wallet holding the position tokens,
+- set `CLAIM_PRIVATE_KEY` to that same wallet's key,
+- keep `PROXY_WALLET`/`PRIVATE_KEY` for trading if needed.
+
