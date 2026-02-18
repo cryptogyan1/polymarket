@@ -214,8 +214,6 @@ impl ClobClient {
         eprintln!("DEBUG HMAC - Body length: {}", body.len());
         eprintln!("DEBUG HMAC - Message: {}", message);
         use base64::{engine::general_purpose, Engine as _};
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
 
         let secret_bytes = general_purpose::URL_SAFE
             .decode(&self.api_secret)
@@ -287,7 +285,6 @@ impl ClobClient {
         }
 
         // Generate random salt
-        use ::rand::Rng; // Use external rand crate explicitly
         let salt = ::rand::random::<u64>().to_string();
 
         // Use the amounts from the order (already calculated)

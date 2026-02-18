@@ -74,6 +74,15 @@ def _safe_rpc_label(url: str) -> str:
         host = rest
     return f"{scheme}://{host}"
 
+def _resolve_control_wallet() -> str:
+    wallet = _clean_env("PROXY_WALLET") or PROXY_WALLET
+    if not wallet:
+        raise RuntimeError(
+            "PROXY_WALLET is required for Telegram control actions when using Safe/proxy flow"
+        )
+    return wallet
+
+
 CTF_CONTRACT = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
@@ -91,6 +100,42 @@ CTF_ABI = [
         "type": "function",
     }
 ]
+
+SAFE_ABI = [
+    {
+        "inputs": [],
+        "name": "getOwners",
+        "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "getThreshold",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "value", "type": "uint256"},
+            {"internalType": "bytes", "name": "data", "type": "bytes"},
+            {"internalType": "enum Enum.Operation", "name": "operation", "type": "uint8"},
+            {"internalType": "uint256", "name": "safeTxGas", "type": "uint256"},
+            {"internalType": "uint256", "name": "baseGas", "type": "uint256"},
+            {"internalType": "uint256", "name": "gasPrice", "type": "uint256"},
+            {"internalType": "address", "name": "gasToken", "type": "address"},
+            {"internalType": "address payable", "name": "refundReceiver", "type": "address"},
+            {"internalType": "bytes", "name": "signatures", "type": "bytes"},
+        ],
+        "name": "execTransaction",
+        "outputs": [{"internalType": "bool", "name": "success", "type": "bool"}],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
 
 
 @dataclass
@@ -230,6 +275,109 @@ def fetch_open_positions(wallet: str) -> List[PositionRow]:
     return out
 
 
+def _is_contract_wallet(w3: Web3, address: str) -> bool:
+    try:
+        code = w3.eth.get_code(Web3.to_checksum_address(address))
+        return bool(code and code != b"" and code != b"\x00" and code != b"\x00" * len(code) and code.hex() != "0x")
+    except Exception:
+        return False
+
+
+def _build_prevalidated_signature(owner: str) -> bytes:
+    owner_bytes = bytes.fromhex(owner[2:].lower())
+    r = owner_bytes.rjust(32, b"\x00")
+    s = (0).to_bytes(32, "big")
+    v = (1).to_bytes(1, "big")
+    return r + s + v
+
+
+def _claim_via_safe(
+    w3: Web3,
+    safe_wallet: str,
+    signer_private_key: str,
+    settled_conditions: List[str],
+) -> List[str]:
+    safe_address = Web3.to_checksum_address(safe_wallet)
+    acct = w3.eth.account.from_key(signer_private_key)
+    owner = Web3.to_checksum_address(acct.address)
+
+    safe = w3.eth.contract(address=safe_address, abi=SAFE_ABI)
+    threshold = int(safe.functions.getThreshold().call())
+    owners = [Web3.to_checksum_address(x) for x in safe.functions.getOwners().call()]
+
+    if owner not in owners:
+        raise RuntimeError(f"CLAIM signer {owner} is not an owner of Safe {safe_address}")
+    if threshold != 1:
+        raise RuntimeError(
+            f"CLAIM Safe threshold={threshold}. Telegram CLAIM currently supports threshold=1 Safe execution only."
+        )
+
+    ctf = w3.eth.contract(address=CTF_CONTRACT, abi=CTF_ABI)
+    safe_nonce = w3.eth.get_transaction_count(owner)
+    tx_hashes: List[str] = []
+
+    for condition_id in settled_conditions:
+        cond_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
+        if len(cond_bytes) != 32:
+            continue
+
+        redeem_data = ctf.functions.redeemPositions(
+            USDC_ADDRESS,
+            b"\x00" * 32,
+            cond_bytes,
+            [1, 2],
+        )._encode_transaction_data()
+
+        signatures = _build_prevalidated_signature(owner)
+
+        fee_params: Dict[str, int] = {}
+        try:
+            latest_block = w3.eth.get_block("latest")
+            base_fee = int(latest_block.get("baseFeePerGas", 0) or 0)
+            priority_fee = int(w3.eth.max_priority_fee)
+            if priority_fee <= 0:
+                priority_fee = w3.to_wei("30", "gwei")
+            fee_params = {
+                "maxPriorityFeePerGas": priority_fee,
+                "maxFeePerGas": max(base_fee * 2 + priority_fee, priority_fee),
+            }
+        except Exception:
+            gas_price = int(w3.eth.gas_price)
+            fee_params = {"gasPrice": max(gas_price, w3.to_wei("50", "gwei"))}
+
+        tx = safe.functions.execTransaction(
+            CTF_CONTRACT,
+            0,
+            redeem_data,
+            0,
+            0,
+            0,
+            0,
+            "0x0000000000000000000000000000000000000000",
+            "0x0000000000000000000000000000000000000000",
+            signatures,
+        ).build_transaction(
+            {
+                "from": owner,
+                "nonce": safe_nonce,
+                "gas": 900_000,
+                "chainId": w3.eth.chain_id,
+                **fee_params,
+            }
+        )
+
+        signed = acct.sign_transaction(tx)
+        txh = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hashes.append(txh.hex())
+        try:
+            w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        except TimeExhausted:
+            pass
+        safe_nonce += 1
+
+    return tx_hashes
+
+
 def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List[str]:
     rpc_url = rpc_url.strip().strip('"').strip("'")
     private_key = private_key.strip().strip('"').strip("'")
@@ -284,14 +432,17 @@ def claim_settled_positions(wallet: str, rpc_url: str, private_key: str) -> List
 
     acct = w3.eth.account.from_key(private_key)
 
-    # redeemPositions redeems only balances owned by the signing address.
-    lookup_wallet = wallet
-    if wallet and wallet.lower() != acct.address.lower():
+    # Safe/proxy path: use PROXY_WALLET for lookup and Safe execution when wallet is a contract.
+    lookup_wallet = wallet or acct.address
+    if not lookup_wallet:
         lookup_wallet = acct.address
 
     settled_conditions = _extract_claimable_condition_ids(lookup_wallet)
     if not settled_conditions:
         return []
+
+    if lookup_wallet and _is_contract_wallet(w3, lookup_wallet):
+        return _claim_via_safe(w3, lookup_wallet, private_key, settled_conditions)
 
     ctf = w3.eth.contract(address=CTF_CONTRACT, abi=CTF_ABI)
 
@@ -399,7 +550,7 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Unauthorized chat")
         return
 
-    wallet = PROXY_WALLET or CLIENT.get_address()
+    wallet = _resolve_control_wallet()
 
     try:
         positions = await asyncio.to_thread(fetch_open_positions, wallet)
@@ -424,7 +575,7 @@ async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _send(update, "❌ Unauthorized chat")
         return
 
-    wallet = PROXY_WALLET or CLIENT.get_address()
+    wallet = _resolve_control_wallet()
     guard = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
 
     try:

@@ -14,6 +14,36 @@ A frequent 401 root cause is bad/mismatched CLOB auth header generation. In this
 
 ## Quick start
 
+## WSL prerequisites (recommended)
+
+On Ubuntu WSL, install the common build/runtime dependencies first:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential pkg-config libssl-dev curl git ca-certificates \
+  python3 python3-venv python3-pip ripgrep
+```
+
+Then ensure Rust is usable in the current shell:
+
+```bash
+# if rustup is already installed, this is enough
+source "$HOME/.cargo/env"
+
+# optional: install rustup only if missing
+command -v rustup >/dev/null 2>&1 || curl https://sh.rustup.rs -sSf | sh -s -- -y
+rustup default stable
+```
+
+> Note: if distro Rust already exists under `/usr/bin`, rustup may warn during install. That warning is safe as long as `cargo --version` and `rustc --version` work after `source ~/.cargo/env`.
+
+Environment quick-check (without ripgrep dependency):
+
+```bash
+grep -E 'TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|PROXY_WALLET|PRIVATE_KEY|TELEGRAM_CONTROL_RPC_URL|POLYGON_RPC_URL' .env
+```
+
 1. Configure `.env` with at least:
 
 ```env
@@ -62,6 +92,12 @@ uvicorn executor.app:app --host 127.0.0.1 --port 8787
 
 ```bash
 cargo run
+```
+
+Or run all three together with one command (executor API + telegram bot + Rust bot):
+
+```bash
+bash scripts/start_bot.sh
 ```
 
 ## Modes
@@ -121,10 +157,14 @@ Notes:
 - and ensures at least 5 shares to satisfy Polymarket limit-order constraints.
 
 
+### Strategy defaults (example `.env` values)
+
+```env
 ARBITRAGE_MAX_SUM=0.985
 MIN_SHARES=5
 MAX_SHARES=25
 STRICT_SHARE_BOUNDS=true
+```
 
 
 Strategy pair logic (only these two combinations are considered):
@@ -150,10 +190,11 @@ Each candidate must satisfy:
 
 - Telegram manual control bot (`executor/telegram_control_bot.py`):
   - `/start` pins keyboard with buttons: `TRACK`, `KILL`, `CLAIM`
-  - `TRACK` fetches current open positions + held shares from Polymarket data API
-  - `KILL` cashes out all open positions immediately using `PositionGuard`
+  - all Telegram control actions run in proxy/Safe mode and require `PROXY_WALLET`
+  - `TRACK` fetches current open positions + held shares from Polymarket data API for `PROXY_WALLET`
+  - `KILL` cashes out all open positions immediately using `PositionGuard` for `PROXY_WALLET`
   - `CLAIM` submits onchain `redeemPositions` txs for settled positions
-  - CLAIM checks settled positions for the signer wallet derived from `PRIVATE_KEY` (redeem is signer-owned onchain)
+  - if `PROXY_WALLET` is a contract wallet, CLAIM executes via Safe `execTransaction` (threshold=1 supported)
   - uses `TELEGRAM_CONTROL_RPC_URL` (or falls back to `POLYGON_RPC_URL`) for CLAIM tx execution
 
 - optional Telegram notifications in executor mode:

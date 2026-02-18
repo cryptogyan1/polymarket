@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 pub use clob_client::ClobClient;
@@ -39,6 +39,42 @@ struct ExecutionEnv {
     trade_fee_bps: f64,
     slippage_bps: f64,
     max_total_shares_per_market: Option<f64>,
+    imbalance_trim_settle_ms: u64,
+    imbalance_trim_settle_ms_retry: u64,
+    paired_execution_mode: PairedExecutionMode,
+    tiered_parallel_ratio_threshold: f64,
+    max_signal_age_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PairedExecutionMode {
+    PureSequential,
+    PureParallel,
+    ParallelCircuitBreaker,
+    Tiered,
+}
+
+impl PairedExecutionMode {
+    fn from_env(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sequential" | "pure_sequential" => Self::PureSequential,
+            "parallel" | "pure_parallel" => Self::PureParallel,
+            "parallel_circuit_breaker" | "circuit_breaker" | "safe_parallel" => {
+                Self::ParallelCircuitBreaker
+            }
+            "tiered" => Self::Tiered,
+            _ => Self::ParallelCircuitBreaker,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PureSequential => "pure_sequential",
+            Self::PureParallel => "pure_parallel",
+            Self::ParallelCircuitBreaker => "parallel_circuit_breaker",
+            Self::Tiered => "tiered",
+        }
+    }
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -96,6 +132,27 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0),
+        imbalance_trim_settle_ms: std::env::var("IMBALANCE_TRIM_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(800),
+        imbalance_trim_settle_ms_retry: std::env::var("IMBALANCE_TRIM_SETTLE_MS_RETRY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300),
+        paired_execution_mode: PairedExecutionMode::from_env(
+            &std::env::var("PAIRED_EXECUTION_MODE")
+                .unwrap_or_else(|_| "parallel_circuit_breaker".to_string()),
+        ),
+        tiered_parallel_ratio_threshold: std::env::var("TIERED_PARALLEL_RATIO_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0),
+        max_signal_age_ms: std::env::var("MAX_SIGNAL_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(800),
     }
 }
 
@@ -150,6 +207,33 @@ fn slippage_bps_from_env() -> f64 {
 
 fn max_total_shares_per_market_from_env() -> Option<f64> {
     env_settings().max_total_shares_per_market
+}
+
+fn imbalance_trim_settle_ms_from_env() -> u64 {
+    env_settings().imbalance_trim_settle_ms
+}
+
+fn imbalance_trim_settle_ms_retry_from_env() -> u64 {
+    env_settings().imbalance_trim_settle_ms_retry
+}
+
+fn paired_execution_mode_from_env() -> PairedExecutionMode {
+    env_settings().paired_execution_mode
+}
+
+fn tiered_parallel_ratio_threshold_from_env() -> f64 {
+    env_settings().tiered_parallel_ratio_threshold
+}
+
+fn max_signal_age_ms_from_env() -> u128 {
+    env_settings().max_signal_age_ms
+}
+
+fn balance_cache_ttl_seconds_from_env() -> u64 {
+    std::env::var("BALANCE_CACHE_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -234,6 +318,41 @@ impl ExecutionState {
         *entry += amount;
     }
 
+    fn trim_shares(&mut self, condition_id: &str, shares_to_trim: f64) {
+        if shares_to_trim <= 0.0 {
+            return;
+        }
+
+        let Some(current_shares) = self.shares_by_condition.get(condition_id).copied() else {
+            return;
+        };
+
+        let trim = shares_to_trim.min(current_shares);
+        let remaining_shares = (current_shares - trim).max(0.0);
+        if remaining_shares <= 0.0 {
+            self.shares_by_condition.remove(condition_id);
+            self.total_effective_cost_by_condition.remove(condition_id);
+            return;
+        }
+
+        let current_total_cost = self
+            .total_effective_cost_by_condition
+            .get(condition_id)
+            .copied()
+            .unwrap_or(0.0);
+        let avg_price = if current_shares > 0.0 {
+            current_total_cost / current_shares
+        } else {
+            0.0
+        };
+        let remaining_cost = (current_total_cost - (trim * avg_price)).max(0.0);
+
+        self.shares_by_condition
+            .insert(condition_id.to_string(), remaining_shares);
+        self.total_effective_cost_by_condition
+            .insert(condition_id.to_string(), remaining_cost);
+    }
+
     fn avg_price(&self, condition_id: &str) -> Option<f64> {
         let shares = *self.shares_by_condition.get(condition_id).unwrap_or(&0.0);
         if shares <= 0.0 {
@@ -263,6 +382,13 @@ struct RebalancePlan {
     shares: f64,
 }
 
+#[derive(Debug, Clone)]
+struct ImbalanceTrimPlan {
+    side_condition_id: String,
+    token_id: String,
+    shares: f64,
+}
+
 pub struct Trader {
     api: Arc<PolymarketClient>,
     clob: Option<Arc<ClobClient>>,
@@ -272,6 +398,7 @@ pub struct Trader {
     signer: Option<WalletSigner>,
     sizing: PositionSizing,
     live_usdc_balance: Arc<Mutex<Decimal>>,
+    balance_last_fetched: Arc<Mutex<Option<Instant>>>,
     execution_state: Arc<Mutex<ExecutionState>>,
 }
 
@@ -325,7 +452,6 @@ impl Trader {
         &self,
         executor: &ExecutorClient,
         token_id: &str,
-        _fallback_bid_price: f64,
         size_shares: f64,
         leg_label: &str,
     ) -> Result<()> {
@@ -337,32 +463,51 @@ impl Trader {
             ));
         }
 
-        // Allow short settlement window so balance snapshots catch up before unwind.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let retry_delays_ms = [
+            0_u64,
+            imbalance_trim_settle_ms_from_env(),
+            imbalance_trim_settle_ms_retry_from_env(),
+        ];
+        let mut last_err: Option<anyhow::Error> = None;
 
-        let safe_unwind_shares = (size_shares * 0.99).max(0.0);
-        if safe_unwind_shares <= 0.0 {
-            return Err(anyhow!(
-                "cannot unwind {} leg because safety-adjusted shares are non-positive: {:.4}",
-                leg_label,
-                safe_unwind_shares
-            ));
+        for (idx, delay_ms) in retry_delays_ms.iter().enumerate() {
+            if *delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            }
+
+            match executor.cashout_position(token_id, size_shares).await {
+                Ok(resp) => {
+                    warn!(
+                        "🧯 Emergency unwind executed via cashout | leg={} attempt={} order_id={:?} requested_shares={:.4} executor_requested_shares={:?}",
+                        leg_label,
+                        idx + 1,
+                        resp.order_id,
+                        size_shares,
+                        resp.requested_shares
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        "❌ Emergency unwind attempt failed | leg={} attempt={} delay_ms={} error={}",
+                        leg_label,
+                        idx + 1,
+                        delay_ms,
+                        err
+                    );
+                    last_err = Some(err);
+                }
+            }
         }
 
-        let resp = executor
-            .cashout_position(token_id, safe_unwind_shares)
-            .await
-            .with_context(|| format!("failed to cashout {} leg", leg_label))?;
-
-        warn!(
-            "🧯 Emergency unwind executed via cashout | leg={} order_id={:?} requested_shares={:.4} settled_shares={:?}",
+        Err(anyhow!(
+            "failed to cashout {} leg after {} attempts: {}",
             leg_label,
-            resp.order_id,
-            safe_unwind_shares,
-            resp.requested_shares
-        );
-
-        Ok(())
+            retry_delays_ms.len(),
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
     fn rebalance_plan(
@@ -485,6 +630,95 @@ impl Trader {
         })
     }
 
+    fn imbalance_trim_plan(
+        &self,
+        state: &ExecutionState,
+        opportunity: &ArbitrageOpportunity,
+    ) -> Option<ImbalanceTrimPlan> {
+        let eth_shares = state.total_eth_shares(&opportunity.eth_condition_id);
+        let btc_shares = state.total_btc_shares(&opportunity.btc_condition_id);
+        let imbalance = (eth_shares - btc_shares).abs();
+        let min_shares = min_shares_from_env();
+        if imbalance < min_shares {
+            return None;
+        }
+
+        let (side_condition_id, token_id, excess_shares) = if eth_shares > btc_shares {
+            (
+                opportunity.eth_condition_id.clone(),
+                opportunity.eth_up_token_id.clone(),
+                eth_shares - btc_shares,
+            )
+        } else {
+            (
+                opportunity.btc_condition_id.clone(),
+                opportunity.btc_down_token_id.clone(),
+                btc_shares - eth_shares,
+            )
+        };
+
+        let shares = excess_shares.floor();
+        if shares < min_shares {
+            return None;
+        }
+
+        Some(ImbalanceTrimPlan {
+            side_condition_id,
+            token_id,
+            shares,
+        })
+    }
+
+    async fn execute_trim_with_recheck(
+        &self,
+        executor: &ExecutorClient,
+        opportunity: &ArbitrageOpportunity,
+        initial_plan: ImbalanceTrimPlan,
+    ) -> Result<()> {
+        let settle_ms = imbalance_trim_settle_ms_from_env();
+        if settle_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+        }
+
+        let refreshed_plan = {
+            let state = self.execution_state.lock().await;
+            self.imbalance_trim_plan(&state, opportunity)
+        };
+
+        let Some(plan) = refreshed_plan else {
+            info!(
+                "✅ TRIM SKIP | pair={} reason=balanced_after_recheck",
+                opportunity.pair_label
+            );
+            return Ok(());
+        };
+
+        let trim_shares = plan.shares.min(initial_plan.shares);
+        if trim_shares < min_shares_from_env() {
+            info!(
+                "✅ TRIM SKIP | pair={} reason=below_min_after_recheck shares={:.2}",
+                opportunity.pair_label, trim_shares
+            );
+            return Ok(());
+        }
+
+        let resp = executor
+            .cashout_position(&plan.token_id, trim_shares)
+            .await?;
+        warn!(
+            "✂️ IMBALANCE TRIM executed | pair={} condition={} requested={:.2} order_id={:?} executor_requested={:?}",
+            opportunity.pair_label,
+            plan.side_condition_id,
+            trim_shares,
+            resp.order_id,
+            resp.requested_shares
+        );
+
+        let mut state = self.execution_state.lock().await;
+        state.trim_shares(&plan.side_condition_id, trim_shares);
+        Ok(())
+    }
+
     pub fn new(
         api: Arc<PolymarketClient>,
         clob: Option<Arc<ClobClient>>,
@@ -502,25 +736,64 @@ impl Trader {
             signer,
             sizing: PositionSizing::from_env(),
             live_usdc_balance: Arc::new(Mutex::new(Decimal::ZERO)),
+            balance_last_fetched: Arc::new(Mutex::new(None)),
             execution_state: Arc::new(Mutex::new(ExecutionState::default())),
         }
     }
 
     async fn refresh_balance(&self) -> Result<()> {
+        let ttl = balance_cache_ttl_seconds_from_env();
+        if ttl > 0 {
+            let last_fetched = *self.balance_last_fetched.lock().await;
+            if let Some(last_fetched) = last_fetched {
+                if last_fetched.elapsed() < Duration::from_secs(ttl) {
+                    let cached = *self.live_usdc_balance.lock().await;
+                    info!("💰 USDC balance (cached): {}", cached);
+                    return Ok(());
+                }
+            }
+        }
+
         let bal = self.api.get_usdc_balance().await?;
         *self.live_usdc_balance.lock().await = bal;
-        info!("💰 USDC balance: {}", bal);
+        *self.balance_last_fetched.lock().await = Some(Instant::now());
+        info!("💰 USDC balance refreshed: {}", bal);
         Ok(())
     }
 
+    async fn deduct_cached_balance(&self, amount: f64) {
+        if amount <= 0.0 {
+            return;
+        }
+
+        let decrement = Decimal::from_f64(amount).unwrap_or(Decimal::ZERO);
+        let mut bal = self.live_usdc_balance.lock().await;
+        let next = (*bal - decrement).max(Decimal::ZERO);
+        *bal = next;
+        info!(
+            "💸 Cached balance adjusted after fill: -${:.4} => {}",
+            amount, next
+        );
+    }
+
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
+        let max_signal_age_ms = max_signal_age_ms_from_env();
+        let signal_age_ms = opportunity.detected_at.elapsed().as_millis();
+        if signal_age_ms > max_signal_age_ms {
+            warn!(
+                "⏰ Signal stale ({}ms > {}ms) — skipping execution",
+                signal_age_ms, max_signal_age_ms
+            );
+            return Ok(());
+        }
+
         self.refresh_balance().await?;
 
         let window_key = Self::window_key(opportunity);
         let trade_limit = per_direction_trade_limit_from_env();
         let balance = self.live_usdc_balance.lock().await.to_f64().unwrap_or(0.0);
 
-        let (direction_count, rebalance_plan) = {
+        let (direction_count, rebalance_plan, trim_plan) = {
             let mut state = self.execution_state.lock().await;
             state.reset_for_window(window_key);
 
@@ -537,8 +810,23 @@ impl Trader {
             );
 
             let plan = self.rebalance_plan(&state, opportunity, balance);
-            (direction_count, plan)
+            let trim_plan = self.imbalance_trim_plan(&state, opportunity);
+            (direction_count, plan, trim_plan)
         };
+
+        if let (Some(executor), Some(plan)) = (&self.executor, trim_plan) {
+            executor.healthcheck().await?;
+            info!(
+                "⚖️ IMBALANCE TRIM MODE | pair={} target_condition={} shares={:.2} settle_ms={}",
+                opportunity.pair_label,
+                plan.side_condition_id,
+                plan.shares,
+                imbalance_trim_settle_ms_from_env()
+            );
+            self.execute_trim_with_recheck(executor, opportunity, plan)
+                .await?;
+            return Ok(());
+        }
 
         let mut rebalance_only = false;
         let mut rebalance_target_condition = String::new();
@@ -772,10 +1060,13 @@ impl Trader {
                     "✅ REBALANCE OK | condition={} added_shares={:.2}",
                     plan.side_condition_id, units
                 );
+                self.deduct_cached_balance(spend).await;
                 return Ok(());
             }
 
             info!("🧮 Executor order sizing | shares_per_leg={}", units);
+            let paired_mode = paired_execution_mode_from_env();
+            info!("🧠 Paired execution mode: {}", paired_mode.as_str());
             info!(
                 "🛡️ Execution safeguards | FOK={} ALLOW_PARTIAL_ARB={} RETRIES={}",
                 executor.fok_enabled(),
@@ -783,7 +1074,11 @@ impl Trader {
                 executor_retry_attempts_from_env()
             );
 
-            let attempts = executor_retry_attempts_from_env();
+            let attempts = if matches!(paired_mode, PairedExecutionMode::PureParallel) {
+                1
+            } else {
+                executor_retry_attempts_from_env()
+            };
             let mut eth_resp = None;
             let mut btc_resp = None;
             let mut one_leg_incident = false;
@@ -819,25 +1114,118 @@ impl Trader {
                     }
                 }
 
-                let eth_future = executor.execute_order(
-                    &opportunity.eth_up_token_id,
-                    Side::Buy,
-                    opportunity.eth_up_price.to_f64().unwrap_or_default(),
-                    size_shares,
-                );
-                let btc_future = executor.execute_order(
-                    &opportunity.btc_down_token_id,
-                    Side::Buy,
-                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
-                    size_shares,
-                );
+                let use_sequential_now = match paired_mode {
+                    PairedExecutionMode::PureSequential => true,
+                    PairedExecutionMode::PureParallel => false,
+                    PairedExecutionMode::ParallelCircuitBreaker => false,
+                    PairedExecutionMode::Tiered => {
+                        let min_liq = opportunity
+                            .eth_leg_ask_size
+                            .to_f64()
+                            .unwrap_or(0.0)
+                            .min(opportunity.btc_leg_ask_size.to_f64().unwrap_or(0.0));
+                        let max_liq = opportunity
+                            .eth_leg_ask_size
+                            .to_f64()
+                            .unwrap_or(0.0)
+                            .max(opportunity.btc_leg_ask_size.to_f64().unwrap_or(0.0));
+                        let ratio = if max_liq > 0.0 {
+                            min_liq / max_liq
+                        } else {
+                            0.0
+                        };
+                        let threshold = tiered_parallel_ratio_threshold_from_env();
+                        let sequential = ratio < threshold;
+                        info!(
+                            "🧭 Tiered decision | ratio={:.3} threshold={:.3} => {}",
+                            ratio,
+                            threshold,
+                            if sequential {
+                                "sequential"
+                            } else {
+                                "parallel_circuit_breaker"
+                            }
+                        );
+                        sequential
+                    }
+                };
 
-                let (eth_result, btc_result) = tokio::join!(eth_future, btc_future);
+                let (eth_result, btc_result) = if use_sequential_now {
+                    let eth_result = executor
+                        .execute_order(
+                            &opportunity.eth_up_token_id,
+                            Side::Buy,
+                            opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                            size_shares,
+                        )
+                        .await;
+
+                    match eth_result {
+                        Ok(eth_ok) => {
+                            let btc_result = executor
+                                .execute_order(
+                                    &opportunity.btc_down_token_id,
+                                    Side::Buy,
+                                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                    size_shares,
+                                )
+                                .await;
+                            (Ok(eth_ok), btc_result)
+                        }
+                        Err(eth_err) => (
+                            Err(eth_err),
+                            Err(anyhow!(
+                                "btc skipped because eth leg failed in sequential mode"
+                            )),
+                        ),
+                    }
+                } else {
+                    let eth_future = executor.execute_order(
+                        &opportunity.eth_up_token_id,
+                        Side::Buy,
+                        opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                        size_shares,
+                    );
+                    let btc_future = executor.execute_order(
+                        &opportunity.btc_down_token_id,
+                        Side::Buy,
+                        opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                        size_shares,
+                    );
+
+                    tokio::join!(eth_future, btc_future)
+                };
 
                 match (eth_result, btc_result) {
                     (Ok(eth_ok), Ok(btc_ok)) => {
                         info!("✅ ETH leg submitted via executor: {:?}", eth_ok.order_id);
                         info!("✅ BTC leg submitted via executor: {:?}", btc_ok.order_id);
+
+                        let combined_price = opportunity.total_cost.to_f64().unwrap_or_default();
+                        let target_price =
+                            arbitrage_max_sum_from_env() + arbitrage_sum_tolerance_from_env();
+
+                        if let Err(notify_err) = executor
+                            .notify_trade_success(
+                                &opportunity.pair_label,
+                                &opportunity.eth_up_token_id,
+                                opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                eth_ok.order_id.as_deref(),
+                                &opportunity.btc_down_token_id,
+                                opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                btc_ok.order_id.as_deref(),
+                                spend,
+                                combined_price,
+                                target_price,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "⚠️ failed to send executor trade notification: {}",
+                                notify_err
+                            );
+                        }
+
                         eth_resp = Some(eth_ok);
                         btc_resp = Some(btc_ok);
                         break;
@@ -848,6 +1236,14 @@ impl Trader {
                             "❌ BTC leg failed on paired attempt {}/{}: {}",
                             attempt, attempts, e
                         );
+
+                        if matches!(paired_mode, PairedExecutionMode::PureParallel) {
+                            one_leg_incident = true;
+                            warn!(
+                                "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for BTC leg failure"
+                            );
+                            break;
+                        }
 
                         let price_bump = second_leg_price_bump_cents_from_env() / 100.0;
                         let bumped_price =
@@ -887,19 +1283,26 @@ impl Trader {
                             }
                         }
 
-                        let unwind_price = opportunity.eth_up_bid_price.to_f64().unwrap_or(0.0);
                         if let Err(unwind_err) = self
                             .emergency_unwind(
                                 executor,
                                 &opportunity.eth_up_token_id,
-                                unwind_price,
                                 size_shares,
                                 "ETH",
                             )
                             .await
                         {
+                            let mut state = self.execution_state.lock().await;
+                            Self::update_filled_state(
+                                &mut state,
+                                &opportunity.eth_condition_id,
+                                units,
+                                effective_buy_price(
+                                    opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                                ),
+                            );
                             return Err(anyhow!(
-                                "second leg failed and immediate ETH unwind failed. second_leg_error: {}; unwind_error: {}",
+                                "second leg failed and ETH unwind failed after retries; tracked ETH as open residual. second_leg_error: {}; unwind_error: {}",
                                 e,
                                 unwind_err
                             ));
@@ -925,19 +1328,34 @@ impl Trader {
                             attempt, attempts, e
                         );
 
-                        let unwind_price = opportunity.btc_down_bid_price.to_f64().unwrap_or(0.0);
+                        if matches!(paired_mode, PairedExecutionMode::PureParallel) {
+                            one_leg_incident = true;
+                            warn!(
+                                "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for ETH leg failure"
+                            );
+                            break;
+                        }
+
                         if let Err(unwind_err) = self
                             .emergency_unwind(
                                 executor,
                                 &opportunity.btc_down_token_id,
-                                unwind_price,
                                 size_shares,
                                 "BTC",
                             )
                             .await
                         {
+                            let mut state = self.execution_state.lock().await;
+                            Self::update_filled_state(
+                                &mut state,
+                                &opportunity.btc_condition_id,
+                                units,
+                                effective_buy_price(
+                                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                ),
+                            );
                             return Err(anyhow!(
-                                "first leg failed and immediate BTC unwind failed. first_leg_error: {}; unwind_error: {}",
+                                "first leg failed and BTC unwind failed after retries; tracked BTC as open residual. first_leg_error: {}; unwind_error: {}",
                                 e,
                                 unwind_err
                             ));
@@ -1008,6 +1426,7 @@ impl Trader {
                         state.direction_count(&opportunity.pair_label)
                     )
                 );
+                self.deduct_cached_balance(spend).await;
             }
 
             return Ok(());
@@ -1043,6 +1462,7 @@ impl Trader {
                 "✅ REBALANCE OK | condition={} added_shares={:.2}",
                 plan.side_condition_id, units
             );
+            self.deduct_cached_balance(spend).await;
             return Ok(());
         }
 
@@ -1087,6 +1507,8 @@ impl Trader {
                 )
             );
         }
+
+        self.deduct_cached_balance(spend).await;
 
         Ok(())
     }
