@@ -80,7 +80,7 @@ impl WsMarketMonitor {
 
     /// Event-driven monitoring loop.
     ///
-    /// Blocks until `ws_rx` closes (e.g. 15m rollover abort).
+    /// Blocks until `ws_rx` closes (e.g. 15m rollover abort).  
     /// Calls `on_snapshot` synchronously on each book event — no sleep.
     pub async fn start<F, Fut>(&mut self, on_snapshot: F)
     where
