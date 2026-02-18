@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 pub use clob_client::ClobClient;
@@ -220,6 +220,13 @@ fn tiered_parallel_ratio_threshold_from_env() -> f64 {
     env_settings().tiered_parallel_ratio_threshold
 }
 
+fn balance_cache_ttl_seconds_from_env() -> u64 {
+    std::env::var("BALANCE_CACHE_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
 fn str_to_h256(s: &str) -> H256 {
     H256::from_slice(&keccak256(s.as_bytes()))
 }
@@ -382,6 +389,7 @@ pub struct Trader {
     signer: Option<WalletSigner>,
     sizing: PositionSizing,
     live_usdc_balance: Arc<Mutex<Decimal>>,
+    balance_last_fetched: Arc<Mutex<Option<Instant>>>,
     execution_state: Arc<Mutex<ExecutionState>>,
 }
 
@@ -719,15 +727,44 @@ impl Trader {
             signer,
             sizing: PositionSizing::from_env(),
             live_usdc_balance: Arc::new(Mutex::new(Decimal::ZERO)),
+            balance_last_fetched: Arc::new(Mutex::new(None)),
             execution_state: Arc::new(Mutex::new(ExecutionState::default())),
         }
     }
 
     async fn refresh_balance(&self) -> Result<()> {
+        let ttl = balance_cache_ttl_seconds_from_env();
+        if ttl > 0 {
+            let last_fetched = *self.balance_last_fetched.lock().await;
+            if let Some(last_fetched) = last_fetched {
+                if last_fetched.elapsed() < Duration::from_secs(ttl) {
+                    let cached = *self.live_usdc_balance.lock().await;
+                    info!("💰 USDC balance (cached): {}", cached);
+                    return Ok(());
+                }
+            }
+        }
+
         let bal = self.api.get_usdc_balance().await?;
         *self.live_usdc_balance.lock().await = bal;
-        info!("💰 USDC balance: {}", bal);
+        *self.balance_last_fetched.lock().await = Some(Instant::now());
+        info!("💰 USDC balance refreshed: {}", bal);
         Ok(())
+    }
+
+    async fn deduct_cached_balance(&self, amount: f64) {
+        if amount <= 0.0 {
+            return;
+        }
+
+        let decrement = Decimal::from_f64(amount).unwrap_or(Decimal::ZERO);
+        let mut bal = self.live_usdc_balance.lock().await;
+        let next = (*bal - decrement).max(Decimal::ZERO);
+        *bal = next;
+        info!(
+            "💸 Cached balance adjusted after fill: -${:.4} => {}",
+            amount, next
+        );
     }
 
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
@@ -1004,6 +1041,7 @@ impl Trader {
                     "✅ REBALANCE OK | condition={} added_shares={:.2}",
                     plan.side_condition_id, units
                 );
+                self.deduct_cached_balance(spend).await;
                 return Ok(());
             }
 
@@ -1369,6 +1407,7 @@ impl Trader {
                         state.direction_count(&opportunity.pair_label)
                     )
                 );
+                self.deduct_cached_balance(spend).await;
             }
 
             return Ok(());
@@ -1404,6 +1443,7 @@ impl Trader {
                 "✅ REBALANCE OK | condition={} added_shares={:.2}",
                 plan.side_condition_id, units
             );
+            self.deduct_cached_balance(spend).await;
             return Ok(());
         }
 
@@ -1448,6 +1488,8 @@ impl Trader {
                 )
             );
         }
+
+        self.deduct_cached_balance(spend).await;
 
         Ok(())
     }
