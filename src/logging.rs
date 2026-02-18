@@ -31,12 +31,17 @@ impl Log for DualLogger {
             message
         );
 
+        let is_rejection = message.contains("❌ Rejected:");
+        let is_noisy_market_data = message.starts_with("📚 book")
+            || message.starts_with("📈 price_change")
+            || message.starts_with("⚡ best_bid_ask");
+
         // Keep terminal clean: route noisy rejection lines only to dedicated file.
-        if message.contains("❌ Rejected:") {
+        if is_rejection {
             if let Ok(mut rejected_file) = self.rejected_file.lock() {
                 let _ = writeln!(rejected_file, "{}", formatted);
             }
-        } else {
+        } else if !is_noisy_market_data {
             println!("{}", message);
         }
 
