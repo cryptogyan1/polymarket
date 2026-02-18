@@ -127,6 +127,7 @@ pub struct MarketData {
 pub mod order;
 #[derive(Debug, Clone)]
 pub struct ArbitrageOpportunity {
+    pub detected_at: std::time::Instant,
     pub pair_label: String,
     pub eth_up_price: Decimal,
     pub btc_down_price: Decimal,
