@@ -81,25 +81,22 @@ impl WsMarketMonitor {
 
     /// Event-driven monitoring loop.
     ///
-    /// Blocks until `ws_rx` closes (e.g. 15m rollover abort).  
-    /// Calls `on_snapshot` synchronously on each book event — no sleep.
+    /// Blocks until `ws_rx` closes (e.g. 15m rollover abort).
+    ///
+    /// Design: `on_snapshot` is awaited *directly in this loop* — the recv()
+    /// call cannot fire again until execution is fully complete. This prevents
+    /// duplicate execution from stale snapshots because there is no concurrent
+    /// snapshot worker and no queue slot to fill while a trade is in progress.
+    ///
+    /// The only addition over the base monitor is burst-draining: after waking
+    /// on one WS tick we drain rapid follow-up ticks before building a
+    /// snapshot, so evaluation runs on the freshest cache state.
     pub async fn start<F, Fut>(&mut self, on_snapshot: F)
     where
         F: Fn(MarketSnapshot) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         info!("🎬 WsMarketMonitor starting (event-driven, no polling)");
-
-        let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<MarketSnapshot>(1);
-        let on_snapshot = Arc::new(on_snapshot);
-        tokio::spawn({
-            let on_snapshot = on_snapshot.clone();
-            async move {
-                while let Some(snapshot) = signal_rx.recv().await {
-                    on_snapshot(snapshot).await;
-                }
-            }
-        });
 
         loop {
             match self.ws_rx.recv().await {
@@ -115,25 +112,21 @@ impl WsMarketMonitor {
                         update.event_type
                     );
 
-                    let mut skipped = 0usize;
+                    let mut coalesced = 0usize;
                     while let Ok(next_update) = self.ws_rx.try_recv() {
                         if self.tokens.all_ids().contains(&next_update.token_id) {
-                            skipped += 1;
+                            coalesced += 1;
                         }
                     }
-                    if skipped > 0 {
+                    if coalesced > 0 {
                         debug!(
-                            "⏩ Drained {} pending WS updates before snapshot build",
-                            skipped
+                            "⏩ Coalesced {} rapid WS ticks into one snapshot",
+                            coalesced
                         );
                     }
 
                     match self.build_snapshot().await {
-                        Ok(snapshot) => {
-                            if signal_tx.try_send(snapshot).is_err() {
-                                debug!("⏭️ Snapshot dropped: executor still busy");
-                            }
-                        }
+                        Ok(snapshot) => on_snapshot(snapshot).await,
                         Err(e) => {
                             // Cache miss — book not yet received for all 4 tokens
                             debug!("📊 Snapshot incomplete (waiting for WS data): {}", e);
