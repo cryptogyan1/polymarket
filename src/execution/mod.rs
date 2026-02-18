@@ -41,6 +41,39 @@ struct ExecutionEnv {
     max_total_shares_per_market: Option<f64>,
     imbalance_trim_settle_ms: u64,
     imbalance_trim_settle_ms_retry: u64,
+    paired_execution_mode: PairedExecutionMode,
+    tiered_parallel_ratio_threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PairedExecutionMode {
+    PureSequential,
+    PureParallel,
+    ParallelCircuitBreaker,
+    Tiered,
+}
+
+impl PairedExecutionMode {
+    fn from_env(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sequential" | "pure_sequential" => Self::PureSequential,
+            "parallel" | "pure_parallel" => Self::PureParallel,
+            "parallel_circuit_breaker" | "circuit_breaker" | "safe_parallel" => {
+                Self::ParallelCircuitBreaker
+            }
+            "tiered" => Self::Tiered,
+            _ => Self::ParallelCircuitBreaker,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PureSequential => "pure_sequential",
+            Self::PureParallel => "pure_parallel",
+            Self::ParallelCircuitBreaker => "parallel_circuit_breaker",
+            Self::Tiered => "tiered",
+        }
+    }
 }
 
 fn load_execution_env() -> ExecutionEnv {
@@ -106,6 +139,15 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300),
+        paired_execution_mode: PairedExecutionMode::from_env(
+            &std::env::var("PAIRED_EXECUTION_MODE")
+                .unwrap_or_else(|_| "parallel_circuit_breaker".to_string()),
+        ),
+        tiered_parallel_ratio_threshold: std::env::var("TIERED_PARALLEL_RATIO_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0),
     }
 }
 
@@ -168,6 +210,14 @@ fn imbalance_trim_settle_ms_from_env() -> u64 {
 
 fn imbalance_trim_settle_ms_retry_from_env() -> u64 {
     env_settings().imbalance_trim_settle_ms_retry
+}
+
+fn paired_execution_mode_from_env() -> PairedExecutionMode {
+    env_settings().paired_execution_mode
+}
+
+fn tiered_parallel_ratio_threshold_from_env() -> f64 {
+    env_settings().tiered_parallel_ratio_threshold
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -958,6 +1008,8 @@ impl Trader {
             }
 
             info!("🧮 Executor order sizing | shares_per_leg={}", units);
+            let paired_mode = paired_execution_mode_from_env();
+            info!("🧠 Paired execution mode: {}", paired_mode.as_str());
             info!(
                 "🛡️ Execution safeguards | FOK={} ALLOW_PARTIAL_ARB={} RETRIES={}",
                 executor.fok_enabled(),
@@ -965,7 +1017,11 @@ impl Trader {
                 executor_retry_attempts_from_env()
             );
 
-            let attempts = executor_retry_attempts_from_env();
+            let attempts = if matches!(paired_mode, PairedExecutionMode::PureParallel) {
+                1
+            } else {
+                executor_retry_attempts_from_env()
+            };
             let mut eth_resp = None;
             let mut btc_resp = None;
             let mut one_leg_incident = false;
@@ -1001,20 +1057,87 @@ impl Trader {
                     }
                 }
 
-                let eth_future = executor.execute_order(
-                    &opportunity.eth_up_token_id,
-                    Side::Buy,
-                    opportunity.eth_up_price.to_f64().unwrap_or_default(),
-                    size_shares,
-                );
-                let btc_future = executor.execute_order(
-                    &opportunity.btc_down_token_id,
-                    Side::Buy,
-                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
-                    size_shares,
-                );
+                let use_sequential_now = match paired_mode {
+                    PairedExecutionMode::PureSequential => true,
+                    PairedExecutionMode::PureParallel => false,
+                    PairedExecutionMode::ParallelCircuitBreaker => false,
+                    PairedExecutionMode::Tiered => {
+                        let min_liq = opportunity
+                            .eth_leg_ask_size
+                            .to_f64()
+                            .unwrap_or(0.0)
+                            .min(opportunity.btc_leg_ask_size.to_f64().unwrap_or(0.0));
+                        let max_liq = opportunity
+                            .eth_leg_ask_size
+                            .to_f64()
+                            .unwrap_or(0.0)
+                            .max(opportunity.btc_leg_ask_size.to_f64().unwrap_or(0.0));
+                        let ratio = if max_liq > 0.0 {
+                            min_liq / max_liq
+                        } else {
+                            0.0
+                        };
+                        let threshold = tiered_parallel_ratio_threshold_from_env();
+                        let sequential = ratio < threshold;
+                        info!(
+                            "🧭 Tiered decision | ratio={:.3} threshold={:.3} => {}",
+                            ratio,
+                            threshold,
+                            if sequential {
+                                "sequential"
+                            } else {
+                                "parallel_circuit_breaker"
+                            }
+                        );
+                        sequential
+                    }
+                };
 
-                let (eth_result, btc_result) = tokio::join!(eth_future, btc_future);
+                let (eth_result, btc_result) = if use_sequential_now {
+                    let eth_result = executor
+                        .execute_order(
+                            &opportunity.eth_up_token_id,
+                            Side::Buy,
+                            opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                            size_shares,
+                        )
+                        .await;
+
+                    match eth_result {
+                        Ok(eth_ok) => {
+                            let btc_result = executor
+                                .execute_order(
+                                    &opportunity.btc_down_token_id,
+                                    Side::Buy,
+                                    opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                                    size_shares,
+                                )
+                                .await;
+                            (Ok(eth_ok), btc_result)
+                        }
+                        Err(eth_err) => (
+                            Err(eth_err),
+                            Err(anyhow!(
+                                "btc skipped because eth leg failed in sequential mode"
+                            )),
+                        ),
+                    }
+                } else {
+                    let eth_future = executor.execute_order(
+                        &opportunity.eth_up_token_id,
+                        Side::Buy,
+                        opportunity.eth_up_price.to_f64().unwrap_or_default(),
+                        size_shares,
+                    );
+                    let btc_future = executor.execute_order(
+                        &opportunity.btc_down_token_id,
+                        Side::Buy,
+                        opportunity.btc_down_price.to_f64().unwrap_or_default(),
+                        size_shares,
+                    );
+
+                    tokio::join!(eth_future, btc_future)
+                };
 
                 match (eth_result, btc_result) {
                     (Ok(eth_ok), Ok(btc_ok)) => {
@@ -1056,6 +1179,14 @@ impl Trader {
                             "❌ BTC leg failed on paired attempt {}/{}: {}",
                             attempt, attempts, e
                         );
+
+                        if matches!(paired_mode, PairedExecutionMode::PureParallel) {
+                            one_leg_incident = true;
+                            warn!(
+                                "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for BTC leg failure"
+                            );
+                            break;
+                        }
 
                         let price_bump = second_leg_price_bump_cents_from_env() / 100.0;
                         let bumped_price =
@@ -1139,6 +1270,14 @@ impl Trader {
                             "❌ ETH leg failed on paired attempt {}/{}: {}",
                             attempt, attempts, e
                         );
+
+                        if matches!(paired_mode, PairedExecutionMode::PureParallel) {
+                            one_leg_incident = true;
+                            warn!(
+                                "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for ETH leg failure"
+                            );
+                            break;
+                        }
 
                         if let Err(unwind_err) = self
                             .emergency_unwind(
