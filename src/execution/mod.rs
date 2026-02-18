@@ -768,6 +768,19 @@ impl Trader {
     }
 
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
+        let max_signal_age_ms = std::env::var("MAX_SIGNAL_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(800);
+        let signal_age_ms = opportunity.detected_at.elapsed().as_millis();
+        if signal_age_ms > max_signal_age_ms {
+            warn!(
+                "⏰ Signal stale ({}ms > {}ms) — skipping execution",
+                signal_age_ms, max_signal_age_ms
+            );
+            return Ok(());
+        }
+
         self.refresh_balance().await?;
 
         let window_key = Self::window_key(opportunity);

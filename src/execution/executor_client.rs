@@ -14,7 +14,6 @@ pub struct ExecutorClient {
     allow_partial_arb: bool,
 }
 
-
 #[derive(Debug, Serialize)]
 pub struct TelegramNotifyRequest {
     pub r#type: String,
@@ -60,7 +59,10 @@ pub struct CashoutResponse {
 impl ExecutorClient {
     pub fn new(base_url: String) -> Result<Self> {
         let http = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(2))
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .context("failed to build HTTP client for executor")?;
 
@@ -180,7 +182,6 @@ impl ExecutorClient {
 
         Ok(parsed)
     }
-
 
     pub async fn notify_trade_success(
         &self,

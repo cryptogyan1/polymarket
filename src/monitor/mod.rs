@@ -115,21 +115,21 @@ impl WsMarketMonitor {
                         update.event_type
                     );
 
+                    let mut skipped = 0usize;
+                    while let Ok(next_update) = self.ws_rx.try_recv() {
+                        if self.tokens.all_ids().contains(&next_update.token_id) {
+                            skipped += 1;
+                        }
+                    }
+                    if skipped > 0 {
+                        debug!(
+                            "⏩ Drained {} pending WS updates before snapshot build",
+                            skipped
+                        );
+                    }
+
                     match self.build_snapshot().await {
                         Ok(snapshot) => {
-                            let mut skipped = 0usize;
-                            while let Ok(next_update) = self.ws_rx.try_recv() {
-                                if self.tokens.all_ids().contains(&next_update.token_id) {
-                                    skipped += 1;
-                                }
-                            }
-                            if skipped > 0 {
-                                debug!(
-                                    "⏩ Drained {} pending WS updates before signaling",
-                                    skipped
-                                );
-                            }
-
                             if signal_tx.try_send(snapshot).is_err() {
                                 debug!("⏭️ Snapshot dropped: executor still busy");
                             }

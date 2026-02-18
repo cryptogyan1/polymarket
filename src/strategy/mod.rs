@@ -282,6 +282,7 @@ impl ArbitrageDetector {
         );
 
         Some(ArbitrageOpportunity {
+            detected_at: std::time::Instant::now(),
             pair_label: pair_label.to_string(),
             eth_condition_id: eth_condition_id.to_string(),
             btc_condition_id: btc_condition_id.to_string(),
