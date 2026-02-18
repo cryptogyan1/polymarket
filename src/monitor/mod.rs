@@ -19,6 +19,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use rust_decimal::Decimal;
 use std::env;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 // ─── MarketSnapshot (unchanged shape — strategy needs no changes) ─────────────
@@ -80,7 +81,7 @@ impl WsMarketMonitor {
 
     /// Event-driven monitoring loop.
     ///
-    /// Blocks until `ws_rx` closes (e.g. 15m rollover abort).
+    /// Blocks until `ws_rx` closes (e.g. 15m rollover abort).  
     /// Calls `on_snapshot` synchronously on each book event — no sleep.
     pub async fn start<F, Fut>(&mut self, on_snapshot: F)
     where
@@ -88,6 +89,17 @@ impl WsMarketMonitor {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         info!("🎬 WsMarketMonitor starting (event-driven, no polling)");
+
+        let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<MarketSnapshot>(1);
+        let on_snapshot = Arc::new(on_snapshot);
+        tokio::spawn({
+            let on_snapshot = on_snapshot.clone();
+            async move {
+                while let Some(snapshot) = signal_rx.recv().await {
+                    on_snapshot(snapshot).await;
+                }
+            }
+        });
 
         loop {
             match self.ws_rx.recv().await {
@@ -103,8 +115,25 @@ impl WsMarketMonitor {
                         update.event_type
                     );
 
+                    let mut skipped = 0usize;
+                    while let Ok(next_update) = self.ws_rx.try_recv() {
+                        if self.tokens.all_ids().contains(&next_update.token_id) {
+                            skipped += 1;
+                        }
+                    }
+                    if skipped > 0 {
+                        debug!(
+                            "⏩ Drained {} pending WS updates before snapshot build",
+                            skipped
+                        );
+                    }
+
                     match self.build_snapshot().await {
-                        Ok(snapshot) => on_snapshot(snapshot).await,
+                        Ok(snapshot) => {
+                            if signal_tx.try_send(snapshot).is_err() {
+                                debug!("⏭️ Snapshot dropped: executor still busy");
+                            }
+                        }
                         Err(e) => {
                             // Cache miss — book not yet received for all 4 tokens
                             debug!("📊 Snapshot incomplete (waiting for WS data): {}", e);
@@ -205,7 +234,6 @@ impl WsMarketMonitor {
 
 use crate::client::PolymarketClient;
 use crate::execution::orderbook::fetch_orderbook;
-use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tokio::try_join;
 

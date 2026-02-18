@@ -107,20 +107,49 @@ fn current_15m_period() -> u64 {
 
 // ─── Token ID extraction ──────────────────────────────────────────────────────
 
-fn extract_token_ids(market: &domain::Market) -> Result<(String, String)> {
-    let raw = market
-        .clob_token_ids
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("market {} missing clob_token_ids", market.slug))?;
-    let ids: Vec<String> = serde_json::from_str(raw)?;
-    if ids.len() < 2 {
+/// Fetch REAL 77-digit token IDs from the CLOB API.
+/// The Gamma API clobTokenIds field is TRUNCATED and causes WS to receive nothing.
+/// Only the CLOB API /markets/{conditionId} returns the full correct IDs.
+async fn extract_token_ids(condition_id: &str) -> Result<(String, String)> {
+    let clob_url = format!("https://clob.polymarket.com/markets/{}", condition_id);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?;
+
+    let body = http.get(&clob_url).send().await?.text().await?;
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+
+    let tokens = json["tokens"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("CLOB /markets/{} missing 'tokens' array", condition_id))?;
+
+    if tokens.len() < 2 {
         anyhow::bail!(
-            "market {} has only {} token IDs (need 2)",
-            market.slug,
-            ids.len()
+            "CLOB market {} has only {} tokens",
+            condition_id,
+            tokens.len()
         );
     }
-    Ok((ids[0].clone(), ids[1].clone()))
+
+    let up_id = tokens[0]["token_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing token_id[0]"))?
+        .to_string();
+
+    let down_id = tokens[1]["token_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing token_id[1]"))?
+        .to_string();
+
+    if up_id.len() < 30 || down_id.len() < 30 {
+        anyhow::bail!(
+            "Token IDs too short ({}/{} chars) — CLOB API may have returned wrong data",
+            up_id.len(),
+            down_id.len()
+        );
+    }
+
+    Ok((up_id, down_id))
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -237,9 +266,9 @@ async fn main() -> Result<()> {
 
         let (left_market, right_market) = discover_markets(&api, pair_cfg).await?;
 
-        // Extract the 4 token IDs we will subscribe to
-        let (btc_up_id, btc_down_id) = extract_token_ids(&left_market)?;
-        let (eth_up_id, eth_down_id) = extract_token_ids(&right_market)?;
+        // Extract REAL token IDs via CLOB API (Gamma API returns truncated IDs)
+        let (btc_up_id, btc_down_id) = extract_token_ids(&left_market.condition_id).await?;
+        let (eth_up_id, eth_down_id) = extract_token_ids(&right_market.condition_id).await?;
 
         info!(
             "✅ {} market: {} | UP={} DOWN={}",
