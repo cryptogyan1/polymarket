@@ -191,6 +191,8 @@ Each candidate must satisfy:
 
 - market selection toggles in env:
   - `BTC_5_MIN=true` enables BTC-only 5m mode; bot monitors only the BTC 5-minute market and trades in-market complementary legs (`BTC_UP + BTC_DOWN`)
+  - in this mode, `ARBITRAGE_MAX_SUM` is still enforced exactly the same way as cross-pair mode (fee-aware check uses `ARBITRAGE_MAX_SUM + ARBITRAGE_SUM_TOLERANCE`)
+  - if you want a strict 0.95 ceiling, set `ARBITRAGE_MAX_SUM=0.95` and `ARBITRAGE_SUM_TOLERANCE=0.00`
   - when `BTC_5_MIN=false`, cross-pair mode is used and exactly one pair must be enabled:
     - `PAIR_BTC_ETH=true` trades BTC/ETH 15m pair
     - `PAIR_BTC_SOL=true` trades BTC/SOL 15m pair
