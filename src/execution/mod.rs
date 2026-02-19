@@ -9,7 +9,7 @@ use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConf
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
@@ -44,6 +44,7 @@ struct ExecutionEnv {
     paired_execution_mode: PairedExecutionMode,
     tiered_parallel_ratio_threshold: f64,
     max_signal_age_ms: u128,
+    executor_reconcile_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +154,10 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(800),
+        executor_reconcile_interval_ms: std::env::var("EXECUTOR_RECONCILE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3_000),
     }
 }
 
@@ -227,6 +232,10 @@ fn tiered_parallel_ratio_threshold_from_env() -> f64 {
 
 fn max_signal_age_ms_from_env() -> u128 {
     env_settings().max_signal_age_ms
+}
+
+fn executor_reconcile_interval_ms_from_env() -> u64 {
+    env_settings().executor_reconcile_interval_ms
 }
 
 fn balance_cache_ttl_seconds_from_env() -> u64 {
@@ -400,6 +409,8 @@ pub struct Trader {
     live_usdc_balance: Arc<Mutex<Decimal>>,
     balance_last_fetched: Arc<Mutex<Option<Instant>>>,
     execution_state: Arc<Mutex<ExecutionState>>,
+    executor_reconcile_needed: Arc<Mutex<bool>>,
+    executor_last_reconcile: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Trader {
@@ -738,6 +749,8 @@ impl Trader {
             live_usdc_balance: Arc::new(Mutex::new(Decimal::ZERO)),
             balance_last_fetched: Arc::new(Mutex::new(None)),
             execution_state: Arc::new(Mutex::new(ExecutionState::default())),
+            executor_reconcile_needed: Arc::new(Mutex::new(true)),
+            executor_last_reconcile: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -774,6 +787,32 @@ impl Trader {
             "💸 Cached balance adjusted after fill: -${:.4} => {}",
             amount, next
         );
+    }
+
+    async fn should_reconcile_executor_state(&self) -> bool {
+        if *self.executor_reconcile_needed.lock().await {
+            return true;
+        }
+
+        let interval_ms = executor_reconcile_interval_ms_from_env();
+        if interval_ms == 0 {
+            return false;
+        }
+
+        let last = *self.executor_last_reconcile.lock().await;
+        match last {
+            None => true,
+            Some(last_ok) => last_ok.elapsed() >= Duration::from_millis(interval_ms),
+        }
+    }
+
+    async fn mark_executor_reconciled(&self) {
+        *self.executor_reconcile_needed.lock().await = false;
+        *self.executor_last_reconcile.lock().await = Some(Instant::now());
+    }
+
+    async fn mark_executor_reconcile_needed(&self) {
+        *self.executor_reconcile_needed.lock().await = true;
     }
 
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
@@ -1037,29 +1076,36 @@ impl Trader {
 
         if let Some(executor) = &self.executor {
             executor.healthcheck().await?;
-            let drain = executor.drain_unwind_queue().await?;
-            if drain.pending > 0 {
-                warn!(
-                    "⏳ Blocking new entries while unwind queue still has {} pending item(s)",
-                    drain.pending
-                );
-                return Ok(());
-            }
 
-            if !rebalance_only {
-                let preflight = executor
-                    .preflight_tokens(&[
-                        opportunity.eth_up_token_id.clone(),
-                        opportunity.btc_down_token_id.clone(),
-                    ])
-                    .await?;
-                if preflight.blocked {
+            if self.should_reconcile_executor_state().await {
+                let drain = executor.drain_unwind_queue().await?;
+                if drain.pending > 0 {
                     warn!(
-                        "⛔ Preflight blocked pair={} due to open token balances on {:?}",
-                        opportunity.pair_label, preflight.blocked_tokens
+                        "⏳ Blocking new entries while unwind queue still has {} pending item(s)",
+                        drain.pending
                     );
+                    self.mark_executor_reconcile_needed().await;
                     return Ok(());
                 }
+
+                if !rebalance_only {
+                    let preflight = executor
+                        .preflight_tokens(&[
+                            opportunity.eth_up_token_id.clone(),
+                            opportunity.btc_down_token_id.clone(),
+                        ])
+                        .await?;
+                    if preflight.blocked {
+                        warn!(
+                            "⛔ Preflight blocked pair={} due to open token balances on {:?}",
+                            opportunity.pair_label, preflight.blocked_tokens
+                        );
+                        self.mark_executor_reconcile_needed().await;
+                        return Ok(());
+                    }
+                }
+
+                self.mark_executor_reconciled().await;
             }
 
             info!("🚀 EXECUTOR MODE | units={} spend=${:.2}", units, spend);
@@ -1266,6 +1312,7 @@ impl Trader {
 
                         if matches!(paired_mode, PairedExecutionMode::PureParallel) {
                             one_leg_incident = true;
+                            self.mark_executor_reconcile_needed().await;
                             warn!(
                                 "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for BTC leg failure"
                             );
@@ -1337,6 +1384,7 @@ impl Trader {
                         eth_resp = None;
 
                         one_leg_incident = true;
+                        self.mark_executor_reconcile_needed().await;
                         if executor.allow_partial_arb() {
                             warn!(
                                 "⚠️ BTC leg failed after ETH fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
@@ -1357,6 +1405,7 @@ impl Trader {
 
                         if matches!(paired_mode, PairedExecutionMode::PureParallel) {
                             one_leg_incident = true;
+                            self.mark_executor_reconcile_needed().await;
                             warn!(
                                 "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for ETH leg failure"
                             );
@@ -1390,6 +1439,7 @@ impl Trader {
                         btc_resp = None;
 
                         one_leg_incident = true;
+                        self.mark_executor_reconcile_needed().await;
                         if executor.allow_partial_arb() {
                             warn!(
                                 "⚠️ ETH leg failed after BTC fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"

@@ -413,6 +413,11 @@ def dequeue_unwind(token_id: str) -> None:
 
 @app.on_event("startup")
 async def startup_event():
+    try:
+        drain_unwind_queue()
+    except Exception as exc:
+        print(f"[executor] startup unwind queue drain failed: {exc}")
+
     if NOTIFIER is None:
         return
 
@@ -550,18 +555,20 @@ def cashout(req: CashoutRequest):
             retry_delay_ms=300,
         )
 
-        if result.ok and NOTIFIER:
-            unwind_info.order_id = result.order_id
-            unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
-            unwind_info.status = "completed"
-            send_telegram_notification(NOTIFIER.update_unwind_complete(unwind_info))
-        elif NOTIFIER and not result.ok:
+        if result.ok:
+            if NOTIFIER:
+                unwind_info.order_id = result.order_id
+                unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
+                unwind_info.status = "completed"
+                send_telegram_notification(NOTIFIER.update_unwind_complete(unwind_info))
+        else:
             enqueue_unwind(req.token_id, float(result.requested_shares or req.shares or 0.0))
-            unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
-            unwind_info.status = "failed"
-            send_telegram_notification(
-                NOTIFIER.send_unwind_failed(unwind_info, result.error or "unknown unwind error")
-            )
+            if NOTIFIER:
+                unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
+                unwind_info.status = "failed"
+                send_telegram_notification(
+                    NOTIFIER.send_unwind_failed(unwind_info, result.error or "unknown unwind error")
+                )
 
         return CashoutResponse(
             ok=result.ok,
