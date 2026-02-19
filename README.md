@@ -88,10 +88,10 @@ source .venv-executor/bin/activate
 uvicorn executor.app:app --host 127.0.0.1 --port 8787
 ```
 
-4. Start Rust bot:
+4. Start Rust bot (optimized):
 
 ```bash
-cargo run
+RUSTFLAGS="-C target-cpu=native" cargo run --release
 ```
 
 Or run all three together with one command (executor API + telegram bot + Rust bot):
@@ -99,6 +99,14 @@ Or run all three together with one command (executor API + telegram bot + Rust b
 ```bash
 bash scripts/start_bot.sh
 ```
+
+
+### Latency-focused defaults now enabled
+
+- Rust build uses release profile tuning (`opt-level=3`, fat LTO, single codegen unit, `panic=abort`).
+- `scripts/start_bot.sh` launches Rust in release mode with `target-cpu=native`.
+- WebSocket reconnect backoff is 100ms (faster recovery vs 2s).
+- Bot prewarms next-period 15m market slugs ~30s before rollover for faster discovery at period switch.
 
 ## Modes
 
