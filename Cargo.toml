@@ -39,3 +39,9 @@ path = "src/bin/diagnostics.rs"
 [[bin]]
 name = "test_endpoints"
 path = "src/bin/test_endpoints.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

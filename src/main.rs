@@ -176,6 +176,26 @@ async fn extract_token_ids(condition_id: &str) -> Result<(String, String)> {
     Ok((up_id, down_id))
 }
 
+async fn prewarm_next_period_markets(
+    api: Arc<PolymarketClient>,
+    pair_cfg: PairConfig,
+    next_period: u64,
+) {
+    for (name, prefix) in [
+        (pair_cfg.left_name, pair_cfg.left_prefix),
+        (pair_cfg.right_name, pair_cfg.right_prefix),
+    ] {
+        let slug = format!("{}-updown-15m-{}", prefix, next_period);
+        match api.get_market_by_slug(&slug).await {
+            Ok(market) => info!(
+                "🔥 Prewarmed next {} market slug={} active={}",
+                name, market.slug, market.active
+            ),
+            Err(err) => warn!("⚠️ Prewarm miss for {} slug={}: {}", name, slug, err),
+        }
+    }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -393,8 +413,30 @@ async fn main() -> Result<()> {
         });
 
         // ── Wait for 15m period rollover ───────────────────────────────────
+        let mut prewarmed_next_period = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let secs_until_rollover = 900 - (now_secs % 900);
+
+            if !prewarmed_next_period && secs_until_rollover <= 30 {
+                let next_period = current_period + 900;
+                let api_clone = api.clone();
+                tokio::spawn(prewarm_next_period_markets(
+                    api_clone,
+                    pair_cfg,
+                    next_period,
+                ));
+                prewarmed_next_period = true;
+                info!(
+                    "⏰ {}s to rollover — prewarming next-period market discovery",
+                    secs_until_rollover
+                );
+            }
+
             let new_period = current_15m_period();
             if new_period != current_period {
                 info!("⏰ 15m rollover — restarting WS feed for new markets");

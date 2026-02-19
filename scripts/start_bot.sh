@@ -33,15 +33,15 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 echo "🚀 Starting executor API..."
-uvicorn executor.app:app --host 127.0.0.1 --port 8787 &
+uvicorn executor.app:app --host 127.0.0.1 --port 8787 --workers 4 &
 pids+=("$!")
 
 echo "🤖 Starting telegram control bot..."
 python -m executor.telegram_control_bot &
 pids+=("$!")
 
-echo "🦀 Starting Rust bot..."
-cargo run &
+echo "🦀 Starting Rust bot (release, native CPU flags)..."
+RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native" cargo run --release &
 pids+=("$!")
 
 echo "✅ All three processes started. Press Ctrl+C to stop all."
