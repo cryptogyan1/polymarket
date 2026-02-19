@@ -196,7 +196,7 @@ Each candidate must satisfy:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
 
 - market selection toggles in env:
-  - `SPORTS_MOD=true` enables sports mode that auto-discovers all currently live sports markets and tracks them concurrently
+  - `SPORTS_MOD=true` enables sports mode that auto-discovers live matches from the Sports WS feed and then resolves/tracks all active tradable markets for those live events
   - sports mode rebuilds the live market universe every `SPORTS_REFRESH_SECS` (default 60s), with optional cap `SPORTS_MAX_MARKETS`
   - each live sports market is monitored for in-market complementary-leg arbitrage (`UP + DOWN`) using the same execution/risk rules
   - sports live game-state stream is connected at `wss://sports-api.polymarket.com/ws`; bot auto-responds to `ping` with `pong` and logs updates

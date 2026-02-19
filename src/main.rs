@@ -30,7 +30,7 @@ use monitor::{WatchedTokens, WsMarketMonitor};
 use strategy::ArbitrageDetector;
 use wallet::allowance::verify_allowances;
 use wallet::signer::WalletSigner;
-use ws::{spawn_ws_feed, sports::spawn_sports_scores_listener};
+use ws::{spawn_ws_feed, sports::spawn_live_slug_tracker};
 
 // ─── Pair config ─────────────────────────────────────────────────────────────
 
@@ -540,7 +540,7 @@ async fn run_sports_live_mode(
     dedupe_ms: u64,
 ) -> Result<()> {
     info!("🏟️ SPORTS_MOD=true | discovering all currently live sports markets");
-    spawn_sports_scores_listener(Vec::new());
+    let live_slug_tracker = spawn_live_slug_tracker();
 
     let refresh_secs = std::env::var("SPORTS_REFRESH_SECS")
         .ok()
@@ -552,10 +552,22 @@ async fn run_sports_live_mode(
         .unwrap_or(100);
 
     loop {
-        let tracked = discover_live_sports_markets(&api, max_markets).await?;
+        let live_slugs = { live_slug_tracker.read().await.clone() };
+
+        if live_slugs.is_empty() {
+            warn!(
+                "🏟️ No live sports events currently in-progress from sports WS; retrying in {}s",
+                refresh_secs
+            );
+            tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+            continue;
+        }
+
+        let tracked = discover_live_sports_markets(&api, &live_slugs, max_markets).await?;
         if tracked.is_empty() {
             warn!(
-                "🏟️ No live sports markets found; retrying in {}s",
+                "🏟️ Live sports slugs found ({}), but no active tradable markets resolved; retrying in {}s",
+                live_slugs.len(),
                 refresh_secs
             );
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
@@ -648,38 +660,45 @@ async fn run_sports_live_mode(
 
 async fn discover_live_sports_markets(
     api: &PolymarketClient,
+    live_slugs: &std::collections::HashSet<String>,
     max_markets: usize,
 ) -> Result<Vec<SportsTrackedMarket>> {
     let mut out = Vec::new();
-    let mut offset = 0usize;
-    let page_size = 200usize;
 
-    while out.len() < max_markets {
-        let markets = api.list_markets(page_size, offset).await?;
-        if markets.is_empty() {
+    for slug in live_slugs {
+        if out.len() >= max_markets {
             break;
         }
+
+        let markets = match api.get_event_markets_by_slug(slug).await {
+            Ok(markets) => markets,
+            Err(err) => {
+                warn!(
+                    "🏟️ Could not resolve live slug '{}' to markets: {}",
+                    slug, err
+                );
+                continue;
+            }
+        };
 
         for market in markets {
             if out.len() >= max_markets {
                 break;
             }
 
-            let is_live = market.live.unwrap_or(false)
-                || market
-                    .status
-                    .as_deref()
-                    .map(|s| s.eq_ignore_ascii_case("live") || s.eq_ignore_ascii_case("inprogress"))
-                    .unwrap_or(false)
-                || market.slug.contains("live");
-
-            if !is_live {
+            if !market.active || market.closed {
                 continue;
             }
 
             let (up_id, down_id) = match extract_token_ids(&market.condition_id).await {
                 Ok(ids) => ids,
-                Err(_) => continue,
+                Err(err) => {
+                    warn!(
+                        "🏟️ Failed token extraction for sports market {}: {}",
+                        market.condition_id, err
+                    );
+                    continue;
+                }
             };
 
             out.push(SportsTrackedMarket {
@@ -688,8 +707,6 @@ async fn discover_live_sports_markets(
                 down_id,
             });
         }
-
-        offset += page_size;
     }
 
     Ok(out)

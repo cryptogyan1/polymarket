@@ -197,15 +197,19 @@ impl PolymarketClient {
         let balance_f64 = balance.as_u128() as f64 / 1_000_000.0;
         Ok(Decimal::try_from(balance_f64).unwrap_or_default())
     }
-
-    pub async fn list_markets(&self, limit: usize, offset: usize) -> Result<Vec<Market>> {
-        let url = format!(
-            "{}/markets?active=true&closed=false&limit={}&offset={}",
-            self.gamma_url, limit, offset
-        );
+    pub async fn get_event_markets_by_slug(&self, slug: &str) -> Result<Vec<Market>> {
+        let url = format!("{}/events/slug/{}", self.gamma_url, slug);
 
         let response = self.client.get(&url).send().await?.error_for_status()?;
-        let markets: Vec<Market> = response.json().await?;
+        let json: serde_json::Value = response.json().await?;
+
+        let markets = json["markets"]
+            .as_array()
+            .context("Event markets missing")?
+            .iter()
+            .filter_map(|m| serde_json::from_value::<Market>(m.clone()).ok())
+            .collect::<Vec<_>>();
+
         Ok(markets)
     }
 
