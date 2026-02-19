@@ -18,7 +18,10 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -238,11 +241,12 @@ fn executor_reconcile_interval_ms_from_env() -> u64 {
     env_settings().executor_reconcile_interval_ms
 }
 
-fn balance_cache_ttl_seconds_from_env() -> u64 {
-    std::env::var("BALANCE_CACHE_TTL_SECONDS")
+fn balance_reconcile_interval_seconds_from_env() -> u64 {
+    std::env::var("BALANCE_RECONCILE_INTERVAL_SECONDS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30)
+        .unwrap_or(60)
+        .max(1)
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -408,6 +412,7 @@ pub struct Trader {
     sizing: PositionSizing,
     live_usdc_balance: Arc<Mutex<Decimal>>,
     balance_last_fetched: Arc<Mutex<Option<Instant>>>,
+    balance_reconciler_started: Arc<AtomicBool>,
     execution_state: Arc<Mutex<ExecutionState>>,
     executor_reconcile_needed: Arc<Mutex<bool>>,
     executor_last_reconcile: Arc<Mutex<Option<Instant>>>,
@@ -748,30 +753,43 @@ impl Trader {
             sizing: PositionSizing::from_env(),
             live_usdc_balance: Arc::new(Mutex::new(Decimal::ZERO)),
             balance_last_fetched: Arc::new(Mutex::new(None)),
+            balance_reconciler_started: Arc::new(AtomicBool::new(false)),
             execution_state: Arc::new(Mutex::new(ExecutionState::default())),
             executor_reconcile_needed: Arc::new(Mutex::new(true)),
             executor_last_reconcile: Arc::new(Mutex::new(None)),
         }
     }
 
-    async fn refresh_balance(&self) -> Result<()> {
-        let ttl = balance_cache_ttl_seconds_from_env();
-        if ttl > 0 {
-            let last_fetched = *self.balance_last_fetched.lock().await;
-            if let Some(last_fetched) = last_fetched {
-                if last_fetched.elapsed() < Duration::from_secs(ttl) {
-                    let cached = *self.live_usdc_balance.lock().await;
-                    info!("💰 USDC balance (cached): {}", cached);
-                    return Ok(());
-                }
-            }
+    fn start_shadow_balance_reconciler(&self) {
+        if self
+            .balance_reconciler_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
         }
 
-        let bal = self.api.get_usdc_balance().await?;
-        *self.live_usdc_balance.lock().await = bal;
-        *self.balance_last_fetched.lock().await = Some(Instant::now());
-        info!("💰 USDC balance refreshed: {}", bal);
-        Ok(())
+        let api = Arc::clone(&self.api);
+        let live_usdc_balance = Arc::clone(&self.live_usdc_balance);
+        let balance_last_fetched = Arc::clone(&self.balance_last_fetched);
+        let interval = Duration::from_secs(balance_reconcile_interval_seconds_from_env());
+
+        tokio::spawn(async move {
+            loop {
+                match api.get_usdc_balance().await {
+                    Ok(bal) => {
+                        *live_usdc_balance.lock().await = bal;
+                        *balance_last_fetched.lock().await = Some(Instant::now());
+                        info!("💰 USDC balance reconciled: {}", bal);
+                    }
+                    Err(err) => {
+                        warn!("⚠️ Shadow balance reconcile failed: {}", err);
+                    }
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     async fn deduct_cached_balance(&self, amount: f64) {
@@ -869,7 +887,7 @@ impl Trader {
             return Ok(());
         }
 
-        self.refresh_balance().await?;
+        self.start_shadow_balance_reconciler();
 
         let window_key = Self::window_key(opportunity);
         let trade_limit = per_direction_trade_limit_from_env();

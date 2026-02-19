@@ -338,6 +338,9 @@ GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
 DUST_SHARES = float(os.getenv("DUST_SHARES", "0.5"))
 UNWIND_QUEUE_FILE = Path(os.getenv("UNWIND_QUEUE_PATH", "unwind_queue.json"))
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "true"
+EXECUTOR_WORKERS = max(1, int(os.getenv("EXECUTOR_WORKERS", "4")))
+EXECUTE_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
+
 
 if TELEGRAM_ENABLED:
     try:
@@ -434,6 +437,7 @@ async def startup_event():
 async def shutdown_event():
     if TELEGRAM_DISPATCHER is not None:
         TELEGRAM_DISPATCHER.stop()
+    EXECUTE_THREAD_POOL.shutdown(wait=False)
 
 
 @app.get("/health")
@@ -486,49 +490,54 @@ def drain_unwind_queue():
     return {"ok": True, "pending": len(load_unwind_queue()), "drained": drained}
 
 
-@app.post("/execute", response_model=ExecuteOrderResponse)
-def execute(req: ExecuteOrderRequest):
+def _execute_sync(req: ExecuteOrderRequest) -> ExecuteOrderResponse:
+    side = BUY if req.side == "BUY" else SELL
+    clamped_size = clamp_order_size(req.size_usdc, side)
+    order_args = build_order_args(
+        token_id=req.token_id,
+        side=side,
+        price=req.price,
+        size_usdc=clamped_size,
+        fok=req.fok,
+        fee_rate_bps=resolve_fee_rate_bps(),
+    )
+
     try:
-        side = BUY if req.side == "BUY" else SELL
-        clamped_size = clamp_order_size(req.size_usdc, side)
-        order_args = build_order_args(
+        signed = CLIENT.create_order(order_args)
+        result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
+    except Exception as exc:
+        market_fee_bps = extract_market_fee_bps(exc)
+        if market_fee_bps is None:
+            raise
+
+        effective_fee_bps = resolve_fee_rate_bps(market_fee_bps)
+        print(
+            f"[executor] detected market fee {market_fee_bps} bps for token {req.token_id}; "
+            f"retrying order with fee_rate_bps={effective_fee_bps}"
+        )
+        retry_args = build_order_args(
             token_id=req.token_id,
             side=side,
             price=req.price,
             size_usdc=clamped_size,
             fok=req.fok,
-            fee_rate_bps=resolve_fee_rate_bps(),
+            fee_rate_bps=effective_fee_bps,
         )
+        signed = CLIENT.create_order(retry_args)
+        result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
 
-        try:
-            signed = CLIENT.create_order(order_args)
-            result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
-        except Exception as exc:
-            market_fee_bps = extract_market_fee_bps(exc)
-            if market_fee_bps is None:
-                raise
+    order_id = None
+    if isinstance(result, dict):
+        order_id = result.get("orderID") or result.get("order_id")
 
-            effective_fee_bps = resolve_fee_rate_bps(market_fee_bps)
-            print(
-                f"[executor] detected market fee {market_fee_bps} bps for token {req.token_id}; "
-                f"retrying order with fee_rate_bps={effective_fee_bps}"
-            )
-            retry_args = build_order_args(
-                token_id=req.token_id,
-                side=side,
-                price=req.price,
-                size_usdc=clamped_size,
-                fok=req.fok,
-                fee_rate_bps=effective_fee_bps,
-            )
-            signed = CLIENT.create_order(retry_args)
-            result = CLIENT.post_order(signed, OrderType.FOK if req.fok else OrderType.GTC)
+    return ExecuteOrderResponse(ok=True, order_id=order_id)
 
-        order_id = None
-        if isinstance(result, dict):
-            order_id = result.get("orderID") or result.get("order_id")
 
-        return ExecuteOrderResponse(ok=True, order_id=order_id)
+@app.post("/execute", response_model=ExecuteOrderResponse)
+async def execute(req: ExecuteOrderRequest):
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(EXECUTE_THREAD_POOL, _execute_sync, req)
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc))
