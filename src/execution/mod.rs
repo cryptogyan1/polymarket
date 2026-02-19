@@ -815,6 +815,49 @@ impl Trader {
         *self.executor_reconcile_needed.lock().await = true;
     }
 
+    async fn reconcile_executor_state_if_needed(
+        &self,
+        executor: &ExecutorClient,
+        opportunity: &ArbitrageOpportunity,
+        rebalance_only: bool,
+    ) -> Result<bool> {
+        if !self.should_reconcile_executor_state().await {
+            return Ok(true);
+        }
+
+        executor.healthcheck().await?;
+
+        let drain = executor.drain_unwind_queue().await?;
+        if drain.pending > 0 {
+            warn!(
+                "⏳ Blocking new entries while unwind queue still has {} pending item(s)",
+                drain.pending
+            );
+            self.mark_executor_reconcile_needed().await;
+            return Ok(false);
+        }
+
+        if !rebalance_only {
+            let preflight = executor
+                .preflight_tokens(&[
+                    opportunity.eth_up_token_id.clone(),
+                    opportunity.btc_down_token_id.clone(),
+                ])
+                .await?;
+            if preflight.blocked {
+                warn!(
+                    "⛔ Preflight blocked pair={} due to open token balances on {:?}",
+                    opportunity.pair_label, preflight.blocked_tokens
+                );
+                self.mark_executor_reconcile_needed().await;
+                return Ok(false);
+            }
+        }
+
+        self.mark_executor_reconciled().await;
+        Ok(true)
+    }
+
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
         let max_signal_age_ms = max_signal_age_ms_from_env();
         let signal_age_ms = opportunity.detected_at.elapsed().as_millis();
@@ -1075,37 +1118,11 @@ impl Trader {
         }
 
         if let Some(executor) = &self.executor {
-            executor.healthcheck().await?;
-
-            if self.should_reconcile_executor_state().await {
-                let drain = executor.drain_unwind_queue().await?;
-                if drain.pending > 0 {
-                    warn!(
-                        "⏳ Blocking new entries while unwind queue still has {} pending item(s)",
-                        drain.pending
-                    );
-                    self.mark_executor_reconcile_needed().await;
-                    return Ok(());
-                }
-
-                if !rebalance_only {
-                    let preflight = executor
-                        .preflight_tokens(&[
-                            opportunity.eth_up_token_id.clone(),
-                            opportunity.btc_down_token_id.clone(),
-                        ])
-                        .await?;
-                    if preflight.blocked {
-                        warn!(
-                            "⛔ Preflight blocked pair={} due to open token balances on {:?}",
-                            opportunity.pair_label, preflight.blocked_tokens
-                        );
-                        self.mark_executor_reconcile_needed().await;
-                        return Ok(());
-                    }
-                }
-
-                self.mark_executor_reconciled().await;
+            if !self
+                .reconcile_executor_state_if_needed(executor, opportunity, rebalance_only)
+                .await?
+            {
+                return Ok(());
             }
 
             info!("🚀 EXECUTOR MODE | units={} spend=${:.2}", units, spend);
