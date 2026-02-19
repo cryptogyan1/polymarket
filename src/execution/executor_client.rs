@@ -42,6 +42,26 @@ pub struct ExecuteOrderResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PreflightRequest {
+    pub token_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PreflightResponse {
+    pub ok: bool,
+    pub blocked: bool,
+    pub positions: std::collections::HashMap<String, f64>,
+    pub blocked_tokens: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DrainUnwindQueueResponse {
+    pub ok: bool,
+    pub pending: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CashoutRequest {
     pub token_id: String,
     pub shares: Option<f64>,
@@ -262,6 +282,94 @@ impl ExecutorClient {
         }
 
         Ok(())
+    }
+
+    pub async fn preflight_tokens(&self, token_ids: &[String]) -> Result<PreflightResponse> {
+        let url = format!("{}/preflight", self.base_url.trim_end_matches('/'));
+        let payload = PreflightRequest {
+            token_ids: token_ids.to_vec(),
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send preflight request to executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor preflight response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor preflight failed (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: PreflightResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for preflight response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!(
+                "executor preflight rejected request: {}",
+                parsed
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+
+        Ok(parsed)
+    }
+
+    pub async fn drain_unwind_queue(&self) -> Result<DrainUnwindQueueResponse> {
+        let url = format!("{}/drain_unwind_queue", self.base_url.trim_end_matches('/'));
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("failed to request unwind queue drain from executor")?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .context("failed to read executor unwind queue response body")?;
+
+        if !status.is_success() {
+            let detail = parse_error_detail(&body);
+            return Err(anyhow!(
+                "executor unwind queue drain failed (status {}): {}",
+                status,
+                detail
+            ));
+        }
+
+        let parsed: DrainUnwindQueueResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "executor returned invalid JSON for unwind queue response: {}",
+                body
+            )
+        })?;
+
+        if !parsed.ok {
+            return Err(anyhow!("executor unwind queue drain reported failure"));
+        }
+
+        Ok(parsed)
     }
 
     pub async fn cashout_position(&self, token_id: &str, shares: f64) -> Result<CashoutResponse> {
