@@ -119,10 +119,10 @@ pub fn spawn_ws_feed(
     tokio::spawn(async move {
         loop {
             match connect_and_stream(&ws_url, &token_ids, &cache, &tx).await {
-                Ok(_) => warn!("WS stream ended cleanly — reconnecting in 2 s"),
-                Err(e) => warn!("WS error: {} — reconnecting in 2 s", e),
+                Ok(_) => warn!("WS stream ended cleanly — reconnecting in 100 ms"),
+                Err(e) => warn!("WS error: {} — reconnecting in 100 ms", e),
             }
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_millis(100)).await;
         }
     });
 

@@ -40,8 +40,8 @@ echo "🤖 Starting telegram control bot..."
 python -m executor.telegram_control_bot &
 pids+=("$!")
 
-echo "🦀 Starting Rust bot..."
-cargo run &
+echo "🦀 Starting Rust bot (release, native CPU flags)..."
+RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native" cargo run --release &
 pids+=("$!")
 
 echo "✅ All three processes started. Press Ctrl+C to stop all."
