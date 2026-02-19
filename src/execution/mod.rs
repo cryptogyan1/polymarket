@@ -1037,6 +1037,31 @@ impl Trader {
 
         if let Some(executor) = &self.executor {
             executor.healthcheck().await?;
+            let drain = executor.drain_unwind_queue().await?;
+            if drain.pending > 0 {
+                warn!(
+                    "⏳ Blocking new entries while unwind queue still has {} pending item(s)",
+                    drain.pending
+                );
+                return Ok(());
+            }
+
+            if !rebalance_only {
+                let preflight = executor
+                    .preflight_tokens(&[
+                        opportunity.eth_up_token_id.clone(),
+                        opportunity.btc_down_token_id.clone(),
+                    ])
+                    .await?;
+                if preflight.blocked {
+                    warn!(
+                        "⛔ Preflight blocked pair={} due to open token balances on {:?}",
+                        opportunity.pair_label, preflight.blocked_tokens
+                    );
+                    return Ok(());
+                }
+            }
+
             info!("🚀 EXECUTOR MODE | units={} spend=${:.2}", units, spend);
 
             let size_shares = Decimal::from_f64(units)
