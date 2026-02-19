@@ -1,10 +1,13 @@
 import asyncio
 import concurrent.futures
+import json
 import os
 import threading
 import re
+import time
 import traceback
 from math import floor
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -74,6 +77,18 @@ class CashoutResponse(BaseModel):
     token_id: str
     requested_shares: Optional[float] = None
     order_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class PreflightRequest(BaseModel):
+    token_ids: list[str]
+
+
+class PreflightResponse(BaseModel):
+    ok: bool
+    blocked: bool
+    positions: Dict[str, float]
+    blocked_tokens: list[str] = []
     error: Optional[str] = None
 
 
@@ -320,6 +335,8 @@ class TelegramDispatchRunner:
 
 CLIENT = init_client()
 GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
+DUST_SHARES = float(os.getenv("DUST_SHARES", "0.5"))
+UNWIND_QUEUE_FILE = Path(os.getenv("UNWIND_QUEUE_PATH", "unwind_queue.json"))
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "true"
 
 if TELEGRAM_ENABLED:
@@ -368,8 +385,39 @@ def send_telegram_notification(coro) -> None:
     TELEGRAM_DISPATCHER.submit(coro)
 
 
+def load_unwind_queue() -> list[Dict[str, Any]]:
+    try:
+        if UNWIND_QUEUE_FILE.exists():
+            parsed = json.loads(UNWIND_QUEUE_FILE.read_text())
+            if isinstance(parsed, list):
+                return parsed
+    except Exception as exc:
+        print(f"[executor] failed to load unwind queue: {exc}")
+    return []
+
+
+def save_unwind_queue(queue: list[Dict[str, Any]]) -> None:
+    UNWIND_QUEUE_FILE.write_text(json.dumps(queue))
+
+
+def enqueue_unwind(token_id: str, shares: float) -> None:
+    queue = [item for item in load_unwind_queue() if item.get("token_id") != token_id]
+    queue.append({"token_id": token_id, "shares": float(shares), "added_at": time.time()})
+    save_unwind_queue(queue)
+
+
+def dequeue_unwind(token_id: str) -> None:
+    queue = [item for item in load_unwind_queue() if item.get("token_id") != token_id]
+    save_unwind_queue(queue)
+
+
 @app.on_event("startup")
 async def startup_event():
+    try:
+        drain_unwind_queue()
+    except Exception as exc:
+        print(f"[executor] startup unwind queue drain failed: {exc}")
+
     if NOTIFIER is None:
         return
 
@@ -391,6 +439,51 @@ async def shutdown_event():
 @app.get("/health")
 def health():
     return {"ok": True, "mode": "execution-only"}
+
+
+@app.post("/preflight", response_model=PreflightResponse)
+def preflight(req: PreflightRequest):
+    """Block new entry when any leg already has non-dust inventory."""
+    try:
+        token_ids = [token_id for token_id in req.token_ids if token_id]
+        positions = GUARD.get_positions(token_ids)
+        blocked_tokens = [
+            token_id for token_id, shares in positions.items() if float(shares) > DUST_SHARES
+        ]
+        return PreflightResponse(
+            ok=True,
+            blocked=len(blocked_tokens) > 0,
+            positions=positions,
+            blocked_tokens=blocked_tokens,
+        )
+    except Exception as exc:
+        return PreflightResponse(
+            ok=False,
+            blocked=True,
+            positions={},
+            blocked_tokens=[],
+            error=str(exc),
+        )
+
+
+@app.get("/drain_unwind_queue")
+def drain_unwind_queue():
+    queue = load_unwind_queue()
+    drained = []
+    for item in queue:
+        token_id = str(item.get("token_id", ""))
+        if not token_id:
+            continue
+        result = GUARD.cashout_market(
+            token_id=token_id,
+            shares=None,
+            max_retries=5,
+            retry_delay_ms=500,
+        )
+        if result.ok:
+            dequeue_unwind(token_id)
+        drained.append({"token_id": token_id, "ok": result.ok, "error": result.error})
+    return {"ok": True, "pending": len(load_unwind_queue()), "drained": drained}
 
 
 @app.post("/execute", response_model=ExecuteOrderResponse)
@@ -462,17 +555,20 @@ def cashout(req: CashoutRequest):
             retry_delay_ms=300,
         )
 
-        if result.ok and NOTIFIER:
-            unwind_info.order_id = result.order_id
-            unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
-            unwind_info.status = "completed"
-            send_telegram_notification(NOTIFIER.update_unwind_complete(unwind_info))
-        elif NOTIFIER and not result.ok:
-            unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
-            unwind_info.status = "failed"
-            send_telegram_notification(
-                NOTIFIER.send_unwind_failed(unwind_info, result.error or "unknown unwind error")
-            )
+        if result.ok:
+            if NOTIFIER:
+                unwind_info.order_id = result.order_id
+                unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
+                unwind_info.status = "completed"
+                send_telegram_notification(NOTIFIER.update_unwind_complete(unwind_info))
+        else:
+            enqueue_unwind(req.token_id, float(result.requested_shares or req.shares or 0.0))
+            if NOTIFIER:
+                unwind_info.shares_to_sell = float(result.requested_shares or 0.0)
+                unwind_info.status = "failed"
+                send_telegram_notification(
+                    NOTIFIER.send_unwind_failed(unwind_info, result.error or "unknown unwind error")
+                )
 
         return CashoutResponse(
             ok=result.ok,
