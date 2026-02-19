@@ -197,6 +197,18 @@ impl PolymarketClient {
         let balance_f64 = balance.as_u128() as f64 / 1_000_000.0;
         Ok(Decimal::try_from(balance_f64).unwrap_or_default())
     }
+
+    pub async fn list_markets(&self, limit: usize, offset: usize) -> Result<Vec<Market>> {
+        let url = format!(
+            "{}/markets?active=true&closed=false&limit={}&offset={}",
+            self.gamma_url, limit, offset
+        );
+
+        let response = self.client.get(&url).send().await?.error_for_status()?;
+        let markets: Vec<Market> = response.json().await?;
+        Ok(markets)
+    }
+
     // ==================================================
     // GET MARKET BY SLUG (Gamma)
     // ==================================================

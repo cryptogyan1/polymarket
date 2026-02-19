@@ -23,6 +23,8 @@ pub struct Market {
     pub end_date_iso_alt: Option<String>,
     pub active: bool,
     pub closed: bool,
+    pub live: Option<bool>,
+    pub status: Option<String>,
     pub tokens: Option<Vec<Token>>,
     #[serde(rename = "clobTokenIds")]
     pub clob_token_ids: Option<String>,

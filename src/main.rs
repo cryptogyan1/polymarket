@@ -46,17 +46,7 @@ struct PairConfig {
 enum BotMode {
     CrossPair(PairConfig),
     BtcFiveMinute,
-    SportsPair(SportsConfig),
-}
-
-#[derive(Clone)]
-struct SportsConfig {
-    left_condition_id: String,
-    right_condition_id: String,
-    left_name: String,
-    right_name: String,
-    left_slug: Option<String>,
-    right_slug: Option<String>,
+    SportsLive,
 }
 
 fn parse_env_bool(raw: &str) -> bool {
@@ -88,40 +78,7 @@ fn opportunity_signature(opp: &ArbitrageOpportunity) -> String {
 
 fn selected_mode() -> Result<BotMode> {
     if env_bool_any_optional(&["SPORTS_MOD", "SPORTS_MODE"]).unwrap_or(false) {
-        let left_condition_id = std::env::var("SPORTS_LEFT_CONDITION_ID")
-            .or_else(|_| std::env::var("SPORTS_CONDITION_ID"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "SPORTS_MOD=true requires SPORTS_LEFT_CONDITION_ID (or SPORTS_CONDITION_ID)"
-                )
-            })?;
-
-        let right_condition_id = std::env::var("SPORTS_RIGHT_CONDITION_ID")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| left_condition_id.clone());
-
-        let left_name =
-            std::env::var("SPORTS_LEFT_NAME").unwrap_or_else(|_| "SPORTS_A".to_string());
-        let right_name = std::env::var("SPORTS_RIGHT_NAME").unwrap_or_else(|_| {
-            if right_condition_id == left_condition_id {
-                "SPORTS".to_string()
-            } else {
-                "SPORTS_B".to_string()
-            }
-        });
-
-        let left_slug = std::env::var("SPORTS_LEFT_SLUG").ok();
-        let right_slug = std::env::var("SPORTS_RIGHT_SLUG").ok();
-
-        return Ok(BotMode::SportsPair(SportsConfig {
-            left_condition_id,
-            right_condition_id,
-            left_name,
-            right_name,
-            left_slug,
-            right_slug,
-        }));
+        return Ok(BotMode::SportsLive);
     }
 
     if env_bool_any_optional(&["BTC_5_MIN"]).unwrap_or(false) {
@@ -356,7 +313,7 @@ async fn main() -> Result<()> {
     let (window_secs, window_slug, window_label) = match &mode {
         BotMode::CrossPair(_) => (900, "15m", "15m"),
         BotMode::BtcFiveMinute => (300, "5m", "5m"),
-        BotMode::SportsPair(_) => (0, "sports", "sports"),
+        BotMode::SportsLive => (900, "15m", "15m"),
     };
 
     let mut active_period = if window_secs > 0 {
@@ -370,10 +327,22 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
 
+    if matches!(mode, BotMode::SportsLive) {
+        return run_sports_live_mode(
+            api,
+            trader,
+            detector,
+            ws_url,
+            recent_opportunities,
+            dedupe_ms,
+        )
+        .await;
+    }
+
     // ── Main outer loop — restarts every market window ────────────────────────
     loop {
         let mode = selected_mode()?;
-        let (left_market, right_market, right_name, sports_slugs) = match mode.clone() {
+        let (left_market, right_market, right_name) = match mode.clone() {
             BotMode::CrossPair(pair_cfg) => {
                 info!(
                     "🔍 Discovering {} markets for {}-{}",
@@ -381,7 +350,7 @@ async fn main() -> Result<()> {
                 );
                 let (left, right) =
                     discover_markets(&api, pair_cfg, window_secs, window_slug).await?;
-                (left, right, pair_cfg.right_name.to_string(), Vec::new())
+                (left, right, pair_cfg.right_name.to_string())
             }
             BotMode::BtcFiveMinute => {
                 info!(
@@ -390,60 +359,9 @@ async fn main() -> Result<()> {
                 );
                 let btc =
                     discover_single_market(&api, "BTC", "btc", window_secs, window_slug).await?;
-                (btc.clone(), btc, "BTC".to_string(), Vec::new())
+                (btc.clone(), btc, "BTC".to_string())
             }
-            BotMode::SportsPair(sports_cfg) => {
-                info!(
-                    "🏟️ SPORTS_MOD=true | trading sports markets {} and {}",
-                    sports_cfg.left_condition_id, sports_cfg.right_condition_id
-                );
-                let left = domain::Market {
-                    condition_id: sports_cfg.left_condition_id.clone(),
-                    market_id: None,
-                    name: Some(sports_cfg.left_name.clone()),
-                    question: sports_cfg.left_name.clone(),
-                    slug: sports_cfg
-                        .left_slug
-                        .clone()
-                        .unwrap_or_else(|| format!("sports-{}", sports_cfg.left_condition_id)),
-                    resolution_source: None,
-                    end_date_iso: None,
-                    end_date_iso_alt: None,
-                    active: true,
-                    closed: false,
-                    tokens: None,
-                    clob_token_ids: None,
-                    outcomes: None,
-                };
-                let right = domain::Market {
-                    condition_id: sports_cfg.right_condition_id.clone(),
-                    market_id: None,
-                    name: Some(sports_cfg.right_name.clone()),
-                    question: sports_cfg.right_name.clone(),
-                    slug: sports_cfg
-                        .right_slug
-                        .clone()
-                        .unwrap_or_else(|| format!("sports-{}", sports_cfg.right_condition_id)),
-                    resolution_source: None,
-                    end_date_iso: None,
-                    end_date_iso_alt: None,
-                    active: true,
-                    closed: false,
-                    tokens: None,
-                    clob_token_ids: None,
-                    outcomes: None,
-                };
-
-                let mut sports_slugs = Vec::new();
-                if let Some(slug) = sports_cfg.left_slug {
-                    sports_slugs.push(slug);
-                }
-                if let Some(slug) = sports_cfg.right_slug {
-                    sports_slugs.push(slug);
-                }
-
-                (left, right, sports_cfg.right_name, sports_slugs)
-            }
+            BotMode::SportsLive => unreachable!("sports mode handled in dedicated path"),
         };
 
         // Extract REAL token IDs via CLOB API (Gamma API returns truncated IDs)
@@ -485,10 +403,6 @@ async fn main() -> Result<()> {
         };
 
         let btc_up_ref = Arc::new(btc_up_id.clone());
-
-        if matches!(mode, BotMode::SportsPair(_)) {
-            spawn_sports_scores_listener(sports_slugs.clone());
-        }
 
         // ── Spawn WS feed for this period ──────────────────────────────────
         let cache = PriceCache::new();
@@ -568,13 +482,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        // ── Wait for market-window rollover (sports mode stays on current markets) ─────────
-        if matches!(mode, BotMode::SportsPair(_)) {
-            info!("🏟️ Sports mode running continuously (no time-window rollover)");
-            let _ = monitor_handle.await;
-            continue;
-        }
-
+        // ── Wait for market-window rollover ─────────────────────────────────
         let mut prewarmed_next_period = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -614,6 +522,177 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct SportsTrackedMarket {
+    market: domain::Market,
+    up_id: String,
+    down_id: String,
+}
+
+async fn run_sports_live_mode(
+    api: Arc<PolymarketClient>,
+    trader: Arc<Trader>,
+    detector: Arc<ArbitrageDetector>,
+    ws_url: String,
+    recent_opportunities: Arc<Mutex<HashMap<String, Instant>>>,
+    dedupe_ms: u64,
+) -> Result<()> {
+    info!("🏟️ SPORTS_MOD=true | discovering all currently live sports markets");
+    spawn_sports_scores_listener(Vec::new());
+
+    let refresh_secs = std::env::var("SPORTS_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    let max_markets = std::env::var("SPORTS_MAX_MARKETS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
+
+    loop {
+        let tracked = discover_live_sports_markets(&api, max_markets).await?;
+        if tracked.is_empty() {
+            warn!(
+                "🏟️ No live sports markets found; retrying in {}s",
+                refresh_secs
+            );
+            tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+            continue;
+        }
+
+        let mut id_set = std::collections::HashSet::new();
+        for item in &tracked {
+            id_set.insert(item.up_id.clone());
+            id_set.insert(item.down_id.clone());
+        }
+
+        info!(
+            "🏟️ Tracking {} live sports markets ({} tokens)",
+            tracked.len(),
+            id_set.len()
+        );
+
+        let cache = PriceCache::new();
+        let ws_rx = spawn_ws_feed(ws_url.clone(), id_set.into_iter().collect(), cache.clone());
+
+        let mut handles = Vec::new();
+        for item in tracked {
+            let tokens = WatchedTokens {
+                btc_up_id: item.up_id.clone(),
+                btc_down_id: item.down_id.clone(),
+                eth_up_id: item.up_id.clone(),
+                eth_down_id: item.down_id.clone(),
+                eth_condition_id: item.market.condition_id.clone(),
+                btc_condition_id: item.market.condition_id.clone(),
+                eth_name: item.market.slug.clone(),
+                btc_name: item.market.slug.clone(),
+                id_set: [item.up_id.clone(), item.down_id.clone()]
+                    .into_iter()
+                    .collect(),
+            };
+
+            let mut monitor = WsMarketMonitor::new(cache.clone(), tokens, ws_rx.resubscribe());
+            let detector = detector.clone();
+            let trader = trader.clone();
+            let recent_opportunities = recent_opportunities.clone();
+            let up_ref = Arc::new(item.up_id.clone());
+
+            let h = tokio::spawn(async move {
+                monitor
+                    .start(move |snapshot| {
+                        let detector = detector.clone();
+                        let trader = trader.clone();
+                        let recent_opportunities = recent_opportunities.clone();
+                        let up_ref = up_ref.clone();
+
+                        async move {
+                            let opportunities = detector.detect_opportunities(&snapshot);
+                            for opp in opportunities.iter() {
+                                if opp.eth_up_token_id != *up_ref {
+                                    continue;
+                                }
+
+                                let sig = opportunity_signature(opp);
+                                let now = Instant::now();
+                                if dedupe_ms > 0 {
+                                    let mut seen = recent_opportunities.lock().await;
+                                    if let Some(last_seen) = seen.get(&sig) {
+                                        if now.duration_since(*last_seen)
+                                            < Duration::from_millis(dedupe_ms)
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    seen.insert(sig, now);
+                                }
+
+                                if let Err(err) = trader.execute_arbitrage(opp).await {
+                                    warn!("❌ Sports opportunity failed: {}", err);
+                                }
+                            }
+                        }
+                    })
+                    .await;
+            });
+            handles.push(h);
+        }
+
+        tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+        for h in handles {
+            h.abort();
+        }
+    }
+}
+
+async fn discover_live_sports_markets(
+    api: &PolymarketClient,
+    max_markets: usize,
+) -> Result<Vec<SportsTrackedMarket>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let page_size = 200usize;
+
+    while out.len() < max_markets {
+        let markets = api.list_markets(page_size, offset).await?;
+        if markets.is_empty() {
+            break;
+        }
+
+        for market in markets {
+            if out.len() >= max_markets {
+                break;
+            }
+
+            let is_live = market.live.unwrap_or(false)
+                || market
+                    .status
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case("live") || s.eq_ignore_ascii_case("inprogress"))
+                    .unwrap_or(false)
+                || market.slug.contains("live");
+
+            if !is_live {
+                continue;
+            }
+
+            let (up_id, down_id) = match extract_token_ids(&market.condition_id).await {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+
+            out.push(SportsTrackedMarket {
+                market,
+                up_id,
+                down_id,
+            });
+        }
+
+        offset += page_size;
+    }
+
+    Ok(out)
 }
 
 // ─── Market discovery ─────────────────────────────────────────────────────────
