@@ -9,7 +9,7 @@ use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConf
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
@@ -18,7 +18,10 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -44,6 +47,7 @@ struct ExecutionEnv {
     paired_execution_mode: PairedExecutionMode,
     tiered_parallel_ratio_threshold: f64,
     max_signal_age_ms: u128,
+    executor_reconcile_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +157,10 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(800),
+        executor_reconcile_interval_ms: std::env::var("EXECUTOR_RECONCILE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3_000),
     }
 }
 
@@ -229,11 +237,16 @@ fn max_signal_age_ms_from_env() -> u128 {
     env_settings().max_signal_age_ms
 }
 
-fn balance_cache_ttl_seconds_from_env() -> u64 {
-    std::env::var("BALANCE_CACHE_TTL_SECONDS")
+fn executor_reconcile_interval_ms_from_env() -> u64 {
+    env_settings().executor_reconcile_interval_ms
+}
+
+fn balance_reconcile_interval_seconds_from_env() -> u64 {
+    std::env::var("BALANCE_RECONCILE_INTERVAL_SECONDS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30)
+        .unwrap_or(60)
+        .max(1)
 }
 
 fn str_to_h256(s: &str) -> H256 {
@@ -399,7 +412,10 @@ pub struct Trader {
     sizing: PositionSizing,
     live_usdc_balance: Arc<Mutex<Decimal>>,
     balance_last_fetched: Arc<Mutex<Option<Instant>>>,
+    balance_reconciler_started: Arc<AtomicBool>,
     execution_state: Arc<Mutex<ExecutionState>>,
+    executor_reconcile_needed: Arc<Mutex<bool>>,
+    executor_last_reconcile: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Trader {
@@ -737,28 +753,43 @@ impl Trader {
             sizing: PositionSizing::from_env(),
             live_usdc_balance: Arc::new(Mutex::new(Decimal::ZERO)),
             balance_last_fetched: Arc::new(Mutex::new(None)),
+            balance_reconciler_started: Arc::new(AtomicBool::new(false)),
             execution_state: Arc::new(Mutex::new(ExecutionState::default())),
+            executor_reconcile_needed: Arc::new(Mutex::new(true)),
+            executor_last_reconcile: Arc::new(Mutex::new(None)),
         }
     }
 
-    async fn refresh_balance(&self) -> Result<()> {
-        let ttl = balance_cache_ttl_seconds_from_env();
-        if ttl > 0 {
-            let last_fetched = *self.balance_last_fetched.lock().await;
-            if let Some(last_fetched) = last_fetched {
-                if last_fetched.elapsed() < Duration::from_secs(ttl) {
-                    let cached = *self.live_usdc_balance.lock().await;
-                    info!("💰 USDC balance (cached): {}", cached);
-                    return Ok(());
-                }
-            }
+    fn start_shadow_balance_reconciler(&self) {
+        if self
+            .balance_reconciler_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
         }
 
-        let bal = self.api.get_usdc_balance().await?;
-        *self.live_usdc_balance.lock().await = bal;
-        *self.balance_last_fetched.lock().await = Some(Instant::now());
-        info!("💰 USDC balance refreshed: {}", bal);
-        Ok(())
+        let api = Arc::clone(&self.api);
+        let live_usdc_balance = Arc::clone(&self.live_usdc_balance);
+        let balance_last_fetched = Arc::clone(&self.balance_last_fetched);
+        let interval = Duration::from_secs(balance_reconcile_interval_seconds_from_env());
+
+        tokio::spawn(async move {
+            loop {
+                match api.get_usdc_balance().await {
+                    Ok(bal) => {
+                        *live_usdc_balance.lock().await = bal;
+                        *balance_last_fetched.lock().await = Some(Instant::now());
+                        info!("💰 USDC balance reconciled: {}", bal);
+                    }
+                    Err(err) => {
+                        warn!("⚠️ Shadow balance reconcile failed: {}", err);
+                    }
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     async fn deduct_cached_balance(&self, amount: f64) {
@@ -776,6 +807,75 @@ impl Trader {
         );
     }
 
+    async fn should_reconcile_executor_state(&self) -> bool {
+        if *self.executor_reconcile_needed.lock().await {
+            return true;
+        }
+
+        let interval_ms = executor_reconcile_interval_ms_from_env();
+        if interval_ms == 0 {
+            return false;
+        }
+
+        let last = *self.executor_last_reconcile.lock().await;
+        match last {
+            None => true,
+            Some(last_ok) => last_ok.elapsed() >= Duration::from_millis(interval_ms),
+        }
+    }
+
+    async fn mark_executor_reconciled(&self) {
+        *self.executor_reconcile_needed.lock().await = false;
+        *self.executor_last_reconcile.lock().await = Some(Instant::now());
+    }
+
+    async fn mark_executor_reconcile_needed(&self) {
+        *self.executor_reconcile_needed.lock().await = true;
+    }
+
+    async fn reconcile_executor_state_if_needed(
+        &self,
+        executor: &ExecutorClient,
+        opportunity: &ArbitrageOpportunity,
+        rebalance_only: bool,
+    ) -> Result<bool> {
+        if !self.should_reconcile_executor_state().await {
+            return Ok(true);
+        }
+
+        executor.healthcheck().await?;
+
+        let drain = executor.drain_unwind_queue().await?;
+        if drain.pending > 0 {
+            warn!(
+                "⏳ Blocking new entries while unwind queue still has {} pending item(s)",
+                drain.pending
+            );
+            self.mark_executor_reconcile_needed().await;
+            return Ok(false);
+        }
+
+        if !rebalance_only {
+            let preflight = executor
+                .preflight_tokens(&[
+                    opportunity.eth_up_token_id.clone(),
+                    opportunity.btc_down_token_id.clone(),
+                ])
+                .await?;
+            if preflight.blocked {
+                warn!(
+                    "⛔ Preflight blocked pair={} due to open token balances on {:?}",
+                    opportunity.pair_label, preflight.blocked_tokens
+                );
+                self.mark_executor_reconcile_needed().await;
+                return Ok(false);
+            }
+        }
+
+        self.mark_executor_reconciled().await;
+        Ok(true)
+    }
+
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
         let max_signal_age_ms = max_signal_age_ms_from_env();
         let signal_age_ms = opportunity.detected_at.elapsed().as_millis();
@@ -787,7 +887,7 @@ impl Trader {
             return Ok(());
         }
 
-        self.refresh_balance().await?;
+        self.start_shadow_balance_reconciler();
 
         let window_key = Self::window_key(opportunity);
         let trade_limit = per_direction_trade_limit_from_env();
@@ -1036,7 +1136,13 @@ impl Trader {
         }
 
         if let Some(executor) = &self.executor {
-            executor.healthcheck().await?;
+            if !self
+                .reconcile_executor_state_if_needed(executor, opportunity, rebalance_only)
+                .await?
+            {
+                return Ok(());
+            }
+
             info!("🚀 EXECUTOR MODE | units={} spend=${:.2}", units, spend);
 
             let size_shares = Decimal::from_f64(units)
@@ -1241,6 +1347,7 @@ impl Trader {
 
                         if matches!(paired_mode, PairedExecutionMode::PureParallel) {
                             one_leg_incident = true;
+                            self.mark_executor_reconcile_needed().await;
                             warn!(
                                 "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for BTC leg failure"
                             );
@@ -1312,6 +1419,7 @@ impl Trader {
                         eth_resp = None;
 
                         one_leg_incident = true;
+                        self.mark_executor_reconcile_needed().await;
                         if executor.allow_partial_arb() {
                             warn!(
                                 "⚠️ BTC leg failed after ETH fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
@@ -1332,6 +1440,7 @@ impl Trader {
 
                         if matches!(paired_mode, PairedExecutionMode::PureParallel) {
                             one_leg_incident = true;
+                            self.mark_executor_reconcile_needed().await;
                             warn!(
                                 "⚠️ PURE_PARALLEL mode: skipping circuit-breaker unwind for ETH leg failure"
                             );
@@ -1365,6 +1474,7 @@ impl Trader {
                         btc_resp = None;
 
                         one_leg_incident = true;
+                        self.mark_executor_reconcile_needed().await;
                         if executor.allow_partial_arb() {
                             warn!(
                                 "⚠️ ETH leg failed after BTC fill; unwind submitted and bot will stop retrying this opportunity (ALLOW_PARTIAL_ARB=true)"
