@@ -41,6 +41,8 @@ use url::Url;
 
 use crate::cache::PriceCache;
 
+pub mod sports;
+
 // ─── Public trigger ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

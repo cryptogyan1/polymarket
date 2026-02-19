@@ -59,6 +59,15 @@ EXECUTOR_URL=http://127.0.0.1:8787
 POLY_SIGNATURE_TYPE=2
 # optional: Fill-Or-Kill execution in executor mode
 FOK=false
+# sports mode (if true, bot trades using explicit sports condition IDs)
+SPORTS_MOD=false
+SPORTS_LEFT_CONDITION_ID=
+SPORTS_RIGHT_CONDITION_ID=
+# optional single-market alias (uses same condition on both sides)
+SPORTS_CONDITION_ID=
+# optional sports websocket slug filters for live score logs
+SPORTS_LEFT_SLUG=
+SPORTS_RIGHT_SLUG=
 # BTC-only 5-minute mode (if true, bot only trades BTC Up/Down 5m market)
 BTC_5_MIN=false
 # cross-pair selection (enable exactly one when BTC_5_MIN=false)
@@ -190,6 +199,9 @@ Each candidate must satisfy:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
 
 - market selection toggles in env:
+  - `SPORTS_MOD=true` enables sports mode using explicit condition IDs (`SPORTS_LEFT_CONDITION_ID` + `SPORTS_RIGHT_CONDITION_ID`)
+  - in sports mode, the bot still executes the same complementary token arbitrage logic, but market selection is fixed to those sports condition IDs
+  - sports live game-state stream is connected at `wss://sports-api.polymarket.com/ws`; bot auto-responds to `ping` with `pong` and logs updates (optionally filtered by `SPORTS_LEFT_SLUG` / `SPORTS_RIGHT_SLUG`)
   - `BTC_5_MIN=true` enables BTC-only 5m mode; bot monitors only the BTC 5-minute market and trades in-market complementary legs (`BTC_UP + BTC_DOWN`)
   - in this mode, `ARBITRAGE_MAX_SUM` is still enforced exactly the same way as cross-pair mode (fee-aware check uses `ARBITRAGE_MAX_SUM + ARBITRAGE_SUM_TOLERANCE`)
   - if you want a strict 0.95 ceiling, set `ARBITRAGE_MAX_SUM=0.95` and `ARBITRAGE_SUM_TOLERANCE=0.00`

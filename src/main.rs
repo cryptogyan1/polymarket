@@ -30,7 +30,7 @@ use monitor::{WatchedTokens, WsMarketMonitor};
 use strategy::ArbitrageDetector;
 use wallet::allowance::verify_allowances;
 use wallet::signer::WalletSigner;
-use ws::spawn_ws_feed;
+use ws::{spawn_ws_feed, sports::spawn_sports_scores_listener};
 
 // ─── Pair config ─────────────────────────────────────────────────────────────
 
@@ -42,10 +42,21 @@ struct PairConfig {
     right_prefix: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum BotMode {
     CrossPair(PairConfig),
     BtcFiveMinute,
+    SportsPair(SportsConfig),
+}
+
+#[derive(Clone)]
+struct SportsConfig {
+    left_condition_id: String,
+    right_condition_id: String,
+    left_name: String,
+    right_name: String,
+    left_slug: Option<String>,
+    right_slug: Option<String>,
 }
 
 fn parse_env_bool(raw: &str) -> bool {
@@ -76,6 +87,43 @@ fn opportunity_signature(opp: &ArbitrageOpportunity) -> String {
 }
 
 fn selected_mode() -> Result<BotMode> {
+    if env_bool_any_optional(&["SPORTS_MOD", "SPORTS_MODE"]).unwrap_or(false) {
+        let left_condition_id = std::env::var("SPORTS_LEFT_CONDITION_ID")
+            .or_else(|_| std::env::var("SPORTS_CONDITION_ID"))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "SPORTS_MOD=true requires SPORTS_LEFT_CONDITION_ID (or SPORTS_CONDITION_ID)"
+                )
+            })?;
+
+        let right_condition_id = std::env::var("SPORTS_RIGHT_CONDITION_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| left_condition_id.clone());
+
+        let left_name =
+            std::env::var("SPORTS_LEFT_NAME").unwrap_or_else(|_| "SPORTS_A".to_string());
+        let right_name = std::env::var("SPORTS_RIGHT_NAME").unwrap_or_else(|_| {
+            if right_condition_id == left_condition_id {
+                "SPORTS".to_string()
+            } else {
+                "SPORTS_B".to_string()
+            }
+        });
+
+        let left_slug = std::env::var("SPORTS_LEFT_SLUG").ok();
+        let right_slug = std::env::var("SPORTS_RIGHT_SLUG").ok();
+
+        return Ok(BotMode::SportsPair(SportsConfig {
+            left_condition_id,
+            right_condition_id,
+            left_name,
+            right_name,
+            left_slug,
+            right_slug,
+        }));
+    }
+
     if env_bool_any_optional(&["BTC_5_MIN"]).unwrap_or(false) {
         return Ok(BotMode::BtcFiveMinute);
     }
@@ -305,12 +353,17 @@ async fn main() -> Result<()> {
 
     let ws_url = config.polymarket.ws_url.clone();
     let mode = selected_mode()?;
-    let (window_secs, window_slug, window_label) = match mode {
+    let (window_secs, window_slug, window_label) = match &mode {
         BotMode::CrossPair(_) => (900, "15m", "15m"),
         BotMode::BtcFiveMinute => (300, "5m", "5m"),
+        BotMode::SportsPair(_) => (0, "sports", "sports"),
     };
 
-    let mut active_period = current_window_period(window_secs);
+    let mut active_period = if window_secs > 0 {
+        current_window_period(window_secs)
+    } else {
+        0
+    };
 
     let dedupe_ms: u64 = std::env::var("OPPORTUNITY_DEDUPE_MS")
         .ok()
@@ -320,7 +373,7 @@ async fn main() -> Result<()> {
     // ── Main outer loop — restarts every market window ────────────────────────
     loop {
         let mode = selected_mode()?;
-        let (left_market, right_market, right_name) = match mode {
+        let (left_market, right_market, right_name, sports_slugs) = match mode.clone() {
             BotMode::CrossPair(pair_cfg) => {
                 info!(
                     "🔍 Discovering {} markets for {}-{}",
@@ -328,7 +381,7 @@ async fn main() -> Result<()> {
                 );
                 let (left, right) =
                     discover_markets(&api, pair_cfg, window_secs, window_slug).await?;
-                (left, right, pair_cfg.right_name.to_string())
+                (left, right, pair_cfg.right_name.to_string(), Vec::new())
             }
             BotMode::BtcFiveMinute => {
                 info!(
@@ -337,7 +390,59 @@ async fn main() -> Result<()> {
                 );
                 let btc =
                     discover_single_market(&api, "BTC", "btc", window_secs, window_slug).await?;
-                (btc.clone(), btc, "BTC".to_string())
+                (btc.clone(), btc, "BTC".to_string(), Vec::new())
+            }
+            BotMode::SportsPair(sports_cfg) => {
+                info!(
+                    "🏟️ SPORTS_MOD=true | trading sports markets {} and {}",
+                    sports_cfg.left_condition_id, sports_cfg.right_condition_id
+                );
+                let left = domain::Market {
+                    condition_id: sports_cfg.left_condition_id.clone(),
+                    market_id: None,
+                    name: Some(sports_cfg.left_name.clone()),
+                    question: sports_cfg.left_name.clone(),
+                    slug: sports_cfg
+                        .left_slug
+                        .clone()
+                        .unwrap_or_else(|| format!("sports-{}", sports_cfg.left_condition_id)),
+                    resolution_source: None,
+                    end_date_iso: None,
+                    end_date_iso_alt: None,
+                    active: true,
+                    closed: false,
+                    tokens: None,
+                    clob_token_ids: None,
+                    outcomes: None,
+                };
+                let right = domain::Market {
+                    condition_id: sports_cfg.right_condition_id.clone(),
+                    market_id: None,
+                    name: Some(sports_cfg.right_name.clone()),
+                    question: sports_cfg.right_name.clone(),
+                    slug: sports_cfg
+                        .right_slug
+                        .clone()
+                        .unwrap_or_else(|| format!("sports-{}", sports_cfg.right_condition_id)),
+                    resolution_source: None,
+                    end_date_iso: None,
+                    end_date_iso_alt: None,
+                    active: true,
+                    closed: false,
+                    tokens: None,
+                    clob_token_ids: None,
+                    outcomes: None,
+                };
+
+                let mut sports_slugs = Vec::new();
+                if let Some(slug) = sports_cfg.left_slug {
+                    sports_slugs.push(slug);
+                }
+                if let Some(slug) = sports_cfg.right_slug {
+                    sports_slugs.push(slug);
+                }
+
+                (left, right, sports_cfg.right_name, sports_slugs)
             }
         };
 
@@ -381,6 +486,10 @@ async fn main() -> Result<()> {
 
         let btc_up_ref = Arc::new(btc_up_id.clone());
 
+        if matches!(mode, BotMode::SportsPair(_)) {
+            spawn_sports_scores_listener(sports_slugs.clone());
+        }
+
         // ── Spawn WS feed for this period ──────────────────────────────────
         let cache = PriceCache::new();
         let ws_rx = spawn_ws_feed(ws_url.clone(), tokens.all_ids(), cache.clone());
@@ -390,6 +499,7 @@ async fn main() -> Result<()> {
         let mut monitor = WsMarketMonitor::new(cache, tokens, ws_rx);
 
         // ── WS-driven monitoring task ──────────────────────────────────────
+        let mode_for_detector = mode.clone();
         let monitor_handle = tokio::spawn({
             let detector = detector.clone();
             let trader = trader.clone();
@@ -402,6 +512,7 @@ async fn main() -> Result<()> {
                         let trader = trader.clone();
                         let recent_opportunities = recent_opportunities.clone();
                         let btc_up_ref = btc_up_ref.clone();
+                        let mode_for_snapshot = mode_for_detector.clone();
 
                         async move {
                             let opportunities = detector.detect_opportunities(&snapshot);
@@ -411,7 +522,7 @@ async fn main() -> Result<()> {
                             }
 
                             for (i, opp) in opportunities.iter().enumerate() {
-                                if matches!(mode, BotMode::BtcFiveMinute)
+                                if matches!(mode_for_snapshot, BotMode::BtcFiveMinute)
                                     && opp.eth_up_token_id != *btc_up_ref
                                 {
                                     continue;
@@ -457,7 +568,13 @@ async fn main() -> Result<()> {
             }
         });
 
-        // ── Wait for market-window rollover ─────────────────────────────────
+        // ── Wait for market-window rollover (sports mode stays on current markets) ─────────
+        if matches!(mode, BotMode::SportsPair(_)) {
+            info!("🏟️ Sports mode running continuously (no time-window rollover)");
+            let _ = monitor_handle.await;
+            continue;
+        }
+
         let mut prewarmed_next_period = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
