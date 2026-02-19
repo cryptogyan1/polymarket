@@ -114,7 +114,7 @@ pub fn spawn_ws_feed(
     token_ids: Vec<String>,
     cache: PriceCache,
 ) -> broadcast::Receiver<BookUpdate> {
-    let (tx, rx) = broadcast::channel::<BookUpdate>(512);
+    let (tx, rx) = broadcast::channel::<BookUpdate>(2048);
 
     tokio::spawn(async move {
         loop {
@@ -326,22 +326,25 @@ async fn handle_value(v: &Value, cache: &PriceCache, tx: &broadcast::Sender<Book
 
                 seen_assets.insert(change.asset_id.clone(), (best_bid, best_ask));
 
-                if let Some(mut book) = cache.get(&change.asset_id).await {
+                if let Some(book) = cache.get(&change.asset_id).await {
+                    let mut bids = book.bids.clone();
+                    let mut asks = book.asks.clone();
+
                     match change.side.to_uppercase().as_str() {
                         "BUY" => {
-                            upsert_level(&mut book.bids, price, size);
-                            book.bids.sort_by(|a, b| b.0.cmp(&a.0));
+                            upsert_level(&mut bids, price, size);
+                            bids.sort_by(|a, b| b.0.cmp(&a.0));
                         }
                         "SELL" => {
-                            upsert_level(&mut book.asks, price, size);
-                            book.asks.sort_by(|a, b| a.0.cmp(&b.0));
+                            upsert_level(&mut asks, price, size);
+                            asks.sort_by(|a, b| a.0.cmp(&b.0));
                         }
                         _ => {
                             // Unknown side — apply to whichever existing side matches
-                            apply_level_unknown_side(&mut book.bids, &mut book.asks, price, size);
+                            apply_level_unknown_side(&mut bids, &mut asks, price, size);
                         }
                     }
-                    cache.update(&change.asset_id, book.bids, book.asks).await;
+                    cache.update(&change.asset_id, bids, asks).await;
                 }
                 // If no existing book yet, wait for the next full "book" snapshot
             }

@@ -13,7 +13,7 @@ pub struct CachedOrderbook {
 
 #[derive(Clone)]
 pub struct PriceCache {
-    inner: Arc<RwLock<HashMap<String, CachedOrderbook>>>,
+    inner: Arc<RwLock<HashMap<String, Arc<CachedOrderbook>>>>,
 }
 
 impl PriceCache {
@@ -32,15 +32,15 @@ impl PriceCache {
         let mut map = self.inner.write().await;
         map.insert(
             token_id.to_string(),
-            CachedOrderbook {
+            Arc::new(CachedOrderbook {
                 bids,
                 asks,
                 last_update_ms: now_ms(),
-            },
+            }),
         );
     }
 
-    pub async fn get(&self, token_id: &str) -> Option<CachedOrderbook> {
+    pub async fn get(&self, token_id: &str) -> Option<Arc<CachedOrderbook>> {
         self.inner.read().await.get(token_id).cloned()
     }
 }

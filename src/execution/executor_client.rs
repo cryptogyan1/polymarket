@@ -11,6 +11,7 @@ pub struct ExecutorClient {
     base_url: String,
     http: Client,
     fok_enabled: bool,
+    fok_buy_enabled: bool,
     allow_partial_arb: bool,
 }
 
@@ -91,6 +92,11 @@ impl ExecutorClient {
             .trim()
             .eq_ignore_ascii_case("true");
 
+        let fok_buy_enabled = std::env::var("FOK_BUY")
+            .unwrap_or_else(|_| "false".to_string())
+            .trim()
+            .eq_ignore_ascii_case("true");
+
         let allow_partial_arb = std::env::var("ALLOW_PARTIAL_ARB")
             .unwrap_or_else(|_| "false".to_string())
             .trim()
@@ -100,6 +106,7 @@ impl ExecutorClient {
             base_url,
             http,
             fok_enabled,
+            fok_buy_enabled,
             allow_partial_arb,
         })
     }
@@ -136,7 +143,12 @@ impl ExecutorClient {
         price: f64,
         size_usdc: f64,
     ) -> Result<ExecuteOrderResponse> {
-        self.execute_order_with_fok(token_id, side, price, size_usdc, self.fok_enabled)
+        let fok = match side {
+            Side::Buy => self.fok_buy_enabled || self.fok_enabled,
+            Side::Sell => self.fok_enabled,
+        };
+
+        self.execute_order_with_fok(token_id, side, price, size_usdc, fok)
             .await
     }
 
