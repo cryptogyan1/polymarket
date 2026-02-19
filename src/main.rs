@@ -64,13 +64,6 @@ fn env_bool_any_optional(keys: &[&str]) -> Option<bool> {
     None
 }
 
-fn opportunity_dedupe_ms_from_env() -> u64 {
-    std::env::var("OPPORTUNITY_DEDUPE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1500)
-}
-
 fn opportunity_signature(opp: &ArbitrageOpportunity) -> String {
     format!(
         "{}|{}|{}|{:.4}|{:.4}",
@@ -319,6 +312,11 @@ async fn main() -> Result<()> {
 
     let mut active_period = current_window_period(window_secs);
 
+    let dedupe_ms: u64 = std::env::var("OPPORTUNITY_DEDUPE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+
     // ── Main outer loop — restarts every market window ────────────────────────
     loop {
         let mode = selected_mode()?;
@@ -371,6 +369,14 @@ async fn main() -> Result<()> {
             btc_condition_id: left_market.condition_id.clone(),
             eth_name: right_name,
             btc_name: "BTC".to_string(),
+            id_set: [
+                btc_up_id.clone(),
+                btc_down_id.clone(),
+                eth_up_id.clone(),
+                eth_down_id.clone(),
+            ]
+            .into_iter()
+            .collect(),
         };
 
         let btc_up_ref = Arc::new(btc_up_id.clone());
@@ -411,7 +417,6 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                let dedupe_ms = opportunity_dedupe_ms_from_env();
                                 let sig = opportunity_signature(opp);
                                 let now = Instant::now();
 
