@@ -59,7 +59,9 @@ EXECUTOR_URL=http://127.0.0.1:8787
 POLY_SIGNATURE_TYPE=2
 # optional: Fill-Or-Kill execution in executor mode
 FOK=false
-# pair selection (enable exactly one)
+# BTC-only 5-minute mode (if true, bot only trades BTC Up/Down 5m market)
+BTC_5_MIN=false
+# cross-pair selection (enable exactly one when BTC_5_MIN=false)
 PAIR_BTC_ETH=true
 PAIR_BTC_SOL=false
 PAIR_BTC_XRP=false
@@ -187,11 +189,13 @@ Each candidate must satisfy:
 - strict fixed share mode is enforced when `STRICT_SHARE_BOUNDS=true` and `MIN_SHARES == MAX_SHARES`:
   - the bot will submit exactly that share size or skip the trade (never more / never less)
 
-- pair toggles in env (enable exactly one):
-  - `PAIR_BTC_ETH=true` trades BTC/ETH 15m pair
-  - `PAIR_BTC_SOL=true` trades BTC/SOL 15m pair
-  - `PAIR_BTC_XRP=true` trades BTC/XRP 15m pair
-  - bot rejects startup if none or multiple toggles are enabled
+- market selection toggles in env:
+  - `BTC_5_MIN=true` enables BTC-only 5m mode; bot monitors only the BTC 5-minute market and trades in-market complementary legs (`BTC_UP + BTC_DOWN`)
+  - when `BTC_5_MIN=false`, cross-pair mode is used and exactly one pair must be enabled:
+    - `PAIR_BTC_ETH=true` trades BTC/ETH 15m pair
+    - `PAIR_BTC_SOL=true` trades BTC/SOL 15m pair
+    - `PAIR_BTC_XRP=true` trades BTC/XRP 15m pair
+  - bot rejects startup in cross-pair mode if none or multiple pair toggles are enabled
 
 - one-leg fail-safe unwind in executor mode:
   - if one leg is placed and the other leg fails, bot waits briefly then calls executor `cashout` (GTC market order) on ~99% of the filled leg to avoid FOK $1-min failures

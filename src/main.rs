@@ -1,12 +1,12 @@
 /// main.rs — WS-driven Polymarket arbitrage bot
 ///
 /// Flow:
-///   1. Discover current 15m markets (BTC + ETH pair) via REST
+///   1. Discover current markets via REST (pair mode: 15m, BTC_5_MIN mode: 5m)
 ///   2. Spawn WS feed subscribing to all 4 tokens
 ///   3. WsMarketMonitor reacts to book updates (< 1 ms)
 ///   4. ArbitrageDetector checks opportunity on every update
 ///   5. Trader executes BOTH legs in parallel (tokio::join!)
-///   6. On 15m rollover: restart WS feed + monitor for new markets
+///   6. On market-window rollover: restart WS feed + monitor for new markets
 use polymarket_15m_arbitrage_bot::*;
 
 use anyhow::Result;
@@ -40,6 +40,12 @@ struct PairConfig {
     left_prefix: &'static str,
     right_name: &'static str,
     right_prefix: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum BotMode {
+    CrossPair(PairConfig),
+    BtcFiveMinute,
 }
 
 fn parse_env_bool(raw: &str) -> bool {
@@ -76,7 +82,11 @@ fn opportunity_signature(opp: &ArbitrageOpportunity) -> String {
     )
 }
 
-fn selected_pair_config() -> Result<PairConfig> {
+fn selected_mode() -> Result<BotMode> {
+    if env_bool_any_optional(&["BTC_5_MIN"]).unwrap_or(false) {
+        return Ok(BotMode::BtcFiveMinute);
+    }
+
     let btc_eth = env_bool_any_optional(&["PAIR_BTC_ETH", "BTC_ETH", "BTC-ETH"]);
     let btc_sol = env_bool_any_optional(&["PAIR_BTC_SOL", "BTC_SOL", "BTC-SOL"]);
     let btc_xrp = env_bool_any_optional(&["PAIR_BTC_XRP", "BTC_XRP", "BTC-XRP"]);
@@ -95,38 +105,38 @@ fn selected_pair_config() -> Result<PairConfig> {
     }
 
     if use_btc_eth {
-        return Ok(PairConfig {
+        return Ok(BotMode::CrossPair(PairConfig {
             left_name: "BTC",
             left_prefix: "btc",
             right_name: "ETH",
             right_prefix: "eth",
-        });
+        }));
     }
     if use_btc_sol {
-        return Ok(PairConfig {
+        return Ok(BotMode::CrossPair(PairConfig {
             left_name: "BTC",
             left_prefix: "btc",
             right_name: "SOL",
             right_prefix: "sol",
-        });
+        }));
     }
-    Ok(PairConfig {
+    Ok(BotMode::CrossPair(PairConfig {
         left_name: "BTC",
         left_prefix: "btc",
         right_name: "XRP",
         right_prefix: "xrp",
-    })
+    }))
 }
 
-// ─── 15-minute period helper ──────────────────────────────────────────────────
+// ─── market-window period helper ──────────────────────────────────────────────
 
-fn current_15m_period() -> u64 {
+fn current_window_period(window_secs: u64) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    (now / 900) * 900
+    (now / window_secs) * window_secs
 }
 
 // ─── Token ID extraction ──────────────────────────────────────────────────────
@@ -180,12 +190,13 @@ async fn prewarm_next_period_markets(
     api: Arc<PolymarketClient>,
     pair_cfg: PairConfig,
     next_period: u64,
+    market_window_slug: &str,
 ) {
     for (name, prefix) in [
         (pair_cfg.left_name, pair_cfg.left_prefix),
         (pair_cfg.right_name, pair_cfg.right_prefix),
     ] {
-        let slug = format!("{}-updown-15m-{}", prefix, next_period);
+        let slug = format!("{}-updown-{}-{}", prefix, market_window_slug, next_period);
         match api.get_market_by_slug(&slug).await {
             Ok(market) => info!(
                 "🔥 Prewarmed next {} market slug={} active={}",
@@ -300,17 +311,37 @@ async fn main() -> Result<()> {
         Arc::new(Mutex::new(HashMap::new()));
 
     let ws_url = config.polymarket.ws_url.clone();
-    let mut current_period = current_15m_period();
+    let mode = selected_mode()?;
+    let (window_secs, window_slug, window_label) = match mode {
+        BotMode::CrossPair(_) => (900, "15m", "15m"),
+        BotMode::BtcFiveMinute => (300, "5m", "5m"),
+    };
 
-    // ── Main outer loop — restarts every 15 minutes ───────────────────────────
+    let mut active_period = current_window_period(window_secs);
+
+    // ── Main outer loop — restarts every market window ────────────────────────
     loop {
-        let pair_cfg = selected_pair_config()?;
-        info!(
-            "🔍 Discovering 15m markets for {}-{}",
-            pair_cfg.left_name, pair_cfg.right_name
-        );
-
-        let (left_market, right_market) = discover_markets(&api, pair_cfg).await?;
+        let mode = selected_mode()?;
+        let (left_market, right_market, right_name) = match mode {
+            BotMode::CrossPair(pair_cfg) => {
+                info!(
+                    "🔍 Discovering {} markets for {}-{}",
+                    window_label, pair_cfg.left_name, pair_cfg.right_name
+                );
+                let (left, right) =
+                    discover_markets(&api, pair_cfg, window_secs, window_slug).await?;
+                (left, right, pair_cfg.right_name.to_string())
+            }
+            BotMode::BtcFiveMinute => {
+                info!(
+                    "🔍 BTC_5_MIN=true | discovering active BTC {} market for in-market UP/DOWN arb",
+                    window_label
+                );
+                let btc =
+                    discover_single_market(&api, "BTC", "btc", window_secs, window_slug).await?;
+                (btc.clone(), btc, "BTC".to_string())
+            }
+        };
 
         // Extract REAL token IDs via CLOB API (Gamma API returns truncated IDs)
         let (btc_up_id, btc_down_id) = extract_token_ids(&left_market.condition_id).await?;
@@ -318,14 +349,14 @@ async fn main() -> Result<()> {
 
         info!(
             "✅ {} market: {} | UP={} DOWN={}",
-            pair_cfg.left_name,
+            "BTC",
             left_market.slug,
             &btc_up_id[..16],
             &btc_down_id[..16]
         );
         info!(
             "✅ {} market: {} | UP={} DOWN={}",
-            pair_cfg.right_name,
+            right_name,
             right_market.slug,
             &eth_up_id[..16],
             &eth_down_id[..16]
@@ -338,9 +369,11 @@ async fn main() -> Result<()> {
             eth_down_id: eth_down_id.clone(),
             eth_condition_id: right_market.condition_id.clone(),
             btc_condition_id: left_market.condition_id.clone(),
-            eth_name: pair_cfg.right_name.to_string(),
-            btc_name: pair_cfg.left_name.to_string(),
+            eth_name: right_name,
+            btc_name: "BTC".to_string(),
         };
+
+        let btc_up_ref = Arc::new(btc_up_id.clone());
 
         // ── Spawn WS feed for this period ──────────────────────────────────
         let cache = PriceCache::new();
@@ -362,6 +395,7 @@ async fn main() -> Result<()> {
                         let detector = detector.clone();
                         let trader = trader.clone();
                         let recent_opportunities = recent_opportunities.clone();
+                        let btc_up_ref = btc_up_ref.clone();
 
                         async move {
                             let opportunities = detector.detect_opportunities(&snapshot);
@@ -371,6 +405,12 @@ async fn main() -> Result<()> {
                             }
 
                             for (i, opp) in opportunities.iter().enumerate() {
+                                if matches!(mode, BotMode::BtcFiveMinute)
+                                    && opp.eth_up_token_id != *btc_up_ref
+                                {
+                                    continue;
+                                }
+
                                 let dedupe_ms = opportunity_dedupe_ms_from_env();
                                 let sig = opportunity_signature(opp);
                                 let now = Instant::now();
@@ -412,7 +452,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        // ── Wait for 15m period rollover ───────────────────────────────────
+        // ── Wait for market-window rollover ─────────────────────────────────
         let mut prewarmed_next_period = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -420,27 +460,33 @@ async fn main() -> Result<()> {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
-            let secs_until_rollover = 900 - (now_secs % 900);
+            let secs_until_rollover = window_secs - (now_secs % window_secs);
 
             if !prewarmed_next_period && secs_until_rollover <= 30 {
-                let next_period = current_period + 900;
-                let api_clone = api.clone();
-                tokio::spawn(prewarm_next_period_markets(
-                    api_clone,
-                    pair_cfg,
-                    next_period,
-                ));
+                if let BotMode::CrossPair(pair_cfg) = mode {
+                    let next_period = active_period + window_secs;
+                    let api_clone = api.clone();
+                    tokio::spawn(prewarm_next_period_markets(
+                        api_clone,
+                        pair_cfg,
+                        next_period,
+                        window_slug,
+                    ));
+                    info!(
+                        "⏰ {}s to rollover — prewarming next-period market discovery",
+                        secs_until_rollover
+                    );
+                }
                 prewarmed_next_period = true;
-                info!(
-                    "⏰ {}s to rollover — prewarming next-period market discovery",
-                    secs_until_rollover
-                );
             }
 
-            let new_period = current_15m_period();
-            if new_period != current_period {
-                info!("⏰ 15m rollover — restarting WS feed for new markets");
-                current_period = new_period;
+            let new_period = current_window_period(window_secs);
+            if new_period != active_period {
+                info!(
+                    "⏰ {} rollover — restarting WS feed for new markets",
+                    window_label
+                );
+                active_period = new_period;
                 monitor_handle.abort(); // also kills the WS task via Drop
                 break;
             }
@@ -453,18 +499,17 @@ async fn main() -> Result<()> {
 async fn discover_markets(
     api: &PolymarketClient,
     pair_cfg: PairConfig,
+    window_secs: u64,
+    window_slug: &str,
 ) -> Result<(domain::Market, domain::Market)> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-
     let mut seen = std::collections::HashSet::new();
 
     let left = discover_market(
         api,
         pair_cfg.left_name,
         pair_cfg.left_prefix,
-        now,
+        window_secs,
+        window_slug,
         &mut seen,
     )
     .await?;
@@ -473,7 +518,8 @@ async fn discover_markets(
         api,
         pair_cfg.right_name,
         pair_cfg.right_prefix,
-        now,
+        window_secs,
+        window_slug,
         &mut seen,
     )
     .await?;
@@ -481,18 +527,33 @@ async fn discover_markets(
     Ok((left, right))
 }
 
+async fn discover_single_market(
+    api: &PolymarketClient,
+    name: &str,
+    prefix: &str,
+    window_secs: u64,
+    window_slug: &str,
+) -> Result<domain::Market> {
+    let mut seen = std::collections::HashSet::new();
+    discover_market(api, name, prefix, window_secs, window_slug, &mut seen).await
+}
+
 async fn discover_market(
     api: &PolymarketClient,
     name: &str,
     prefix: &str,
-    now: u64,
+    window_secs: u64,
+    window_slug: &str,
     seen: &mut std::collections::HashSet<String>,
 ) -> Result<domain::Market> {
-    let base = (now / 900) * 900;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let base = (now / window_secs) * window_secs;
 
     for i in 0..=3 {
-        let ts = base - i * 900;
-        let slug = format!("{}-updown-15m-{}", prefix, ts);
+        let ts = base - i * window_secs;
+        let slug = format!("{}-updown-{}-{}", prefix, window_slug, ts);
 
         if let Ok(market) = api.get_market_by_slug(&slug).await {
             if !seen.contains(&market.condition_id) && market.active {
