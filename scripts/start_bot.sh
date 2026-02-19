@@ -33,7 +33,7 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 echo "🚀 Starting executor API..."
-uvicorn executor.app:app --host 127.0.0.1 --port 8787 --workers 4 &
+uvicorn executor.app:app --host 127.0.0.1 --port 8787 --workers 1 &
 pids+=("$!")
 
 echo "🤖 Starting telegram control bot..."

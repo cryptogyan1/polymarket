@@ -14,6 +14,15 @@ from py_clob_client.clob_types import (
 )
 from py_clob_client.order_builder.constants import SELL
 
+MIN_CASHOUT_NOTIONAL_USDC = 1.10
+LOW_NOTIONAL_ERROR_MARKERS = (
+    "invalid amount for a marketable buy order",
+    "amount too small",
+    "minimum notional",
+    "below minimum",
+    "notional",
+)
+
 
 @dataclass
 class CashoutResult:
@@ -103,6 +112,20 @@ class PositionGuard:
                 error="No balance",
             )
 
+        # If notional is near/below the platform minimum, skip market sell retries and
+        # go straight to the limit-sell ladder.
+        try:
+            book = self.client.get_order_book(token_id)
+            best_bid = self._extract_best_bid_price(book) or 0.0
+            notional = target_qty * best_bid
+            if notional < MIN_CASHOUT_NOTIONAL_USDC:
+                ladder_result = self._cashout_with_limit_sell_ladder(token_id, target_qty)
+                if ladder_result is not None:
+                    return ladder_result
+        except Exception:
+            # If order book fetch fails, continue with normal market sell retries.
+            pass
+
         attempts = max(1, int(max_retries))
         last_error: Optional[str] = None
         for attempt in range(attempts):
@@ -144,7 +167,7 @@ class PositionGuard:
 
                 # Polymarket can reject tiny marketable BUY notional during SELL cashouts.
                 # Fall back to limit SELL at best bid and step down if needed.
-                if "invalid amount for a marketable buy order" in error_msg:
+                if any(marker in error_msg for marker in LOW_NOTIONAL_ERROR_MARKERS):
                     ladder_result = self._cashout_with_limit_sell_ladder(token_id, adjusted_qty)
                     if ladder_result is not None:
                         return ladder_result
@@ -207,6 +230,30 @@ class PositionGuard:
 
         return best_price
 
+    def _cancel_order_safely(self, order_id: str) -> None:
+        try:
+            self.client.cancel_orders([order_id])
+        except Exception as exc:
+            print(f"[position_guard] Warning: failed to cancel resting order {order_id}: {exc}")
+
+    def _is_order_still_open(self, token_id: str, order_id: str) -> bool:
+        try:
+            orders = self.client.get_orders(OpenOrderParams(asset_id=token_id))
+        except Exception as exc:
+            print(f"[position_guard] Warning: failed to fetch open orders for {token_id}: {exc}")
+            return False
+
+        if not isinstance(orders, list):
+            return False
+
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            oid = order.get("id") or order.get("orderID")
+            if oid == order_id:
+                return True
+        return False
+
     def _cashout_with_limit_sell_ladder(
         self,
         token_id: str,
@@ -245,6 +292,12 @@ class PositionGuard:
                 signed = self.client.create_order(order_args)
                 posted = self.client.post_order(signed, OrderType.GTC)
                 order_id = posted.get("orderID") if isinstance(posted, dict) else None
+
+                # Posting acceptance != filled. Verify order does not remain open.
+                if order_id and self._is_order_still_open(token_id, order_id):
+                    self._cancel_order_safely(order_id)
+                    continue
+
                 return CashoutResult(
                     token_id=token_id,
                     requested_shares=shares,

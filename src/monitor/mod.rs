@@ -18,6 +18,7 @@ use crate::ws::BookUpdate;
 use anyhow::Result;
 use log::{debug, info, warn};
 use rust_decimal::Decimal;
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -44,17 +45,13 @@ pub struct WatchedTokens {
     pub btc_condition_id: String,
     pub eth_name: String,
     pub btc_name: String,
+    pub id_set: HashSet<String>,
 }
 
 impl WatchedTokens {
     /// Returns all 4 token IDs as a Vec (for WS subscription)
     pub fn all_ids(&self) -> Vec<String> {
-        vec![
-            self.eth_up_id.clone(),
-            self.eth_down_id.clone(),
-            self.btc_up_id.clone(),
-            self.btc_down_id.clone(),
-        ]
+        self.id_set.iter().cloned().collect()
     }
 }
 
@@ -102,7 +99,7 @@ impl WsMarketMonitor {
             match self.ws_rx.recv().await {
                 Ok(update) => {
                     // Only process updates for tokens we actually watch
-                    if !self.tokens.all_ids().contains(&update.token_id) {
+                    if !self.tokens.id_set.contains(&update.token_id) {
                         continue;
                     }
 
@@ -114,7 +111,7 @@ impl WsMarketMonitor {
 
                     let mut coalesced = 0usize;
                     while let Ok(next_update) = self.ws_rx.try_recv() {
-                        if self.tokens.all_ids().contains(&next_update.token_id) {
+                        if self.tokens.id_set.contains(&next_update.token_id) {
                             coalesced += 1;
                         }
                     }
@@ -194,6 +191,22 @@ impl WsMarketMonitor {
                 &token_id[..16.min(token_id.len())]
             )
         })?;
+
+        let age_ms = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .saturating_sub(book.last_update_ms)
+        };
+        if age_ms > 5_000 {
+            return Err(anyhow::anyhow!(
+                "stale book for token {} ({}ms old — WS may have dropped)",
+                &token_id[..16.min(token_id.len())],
+                age_ms
+            ));
+        }
 
         // Best bid: highest price in bids
         let best_bid = book.bids.first().map(|(p, _)| *p);
