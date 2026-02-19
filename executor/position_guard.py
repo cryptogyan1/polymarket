@@ -9,6 +9,7 @@ from py_clob_client.clob_types import (
     BalanceAllowanceParams,
     MarketOrderArgs,
     OpenOrderParams,
+    OrderArgs,
     OrderType,
 )
 from py_clob_client.order_builder.constants import SELL
@@ -141,6 +142,13 @@ class PositionGuard:
                 last_error = str(exc)
                 error_msg = last_error.lower()
 
+                # Polymarket can reject tiny marketable BUY notional during SELL cashouts.
+                # Fall back to limit SELL at best bid and step down if needed.
+                if "invalid amount for a marketable buy order" in error_msg:
+                    ladder_result = self._cashout_with_limit_sell_ladder(token_id, adjusted_qty)
+                    if ladder_result is not None:
+                        return ladder_result
+
                 if "balance" in error_msg or "allowance" in error_msg:
                     target_qty = max(0.0, self.get_token_shares(token_id))
                     time.sleep(max(0, retry_delay_ms) / 1000.0)
@@ -174,6 +182,84 @@ class PositionGuard:
             order_id=None,
             ok=False,
             error=f"Failed after {attempts} attempts: {last_error or 'unknown error'}",
+        )
+
+    def _extract_best_bid_price(self, book: dict) -> Optional[float]:
+        bids = None
+        if isinstance(book, dict):
+            bids = book.get("bids") or book.get("buy") or book.get("buyOrders")
+
+        if not isinstance(bids, list):
+            return None
+
+        best_price = None
+        for level in bids:
+            if not isinstance(level, dict):
+                continue
+            raw_price = level.get("price") or level.get("rate") or level.get("p")
+            try:
+                px = float(raw_price)
+            except Exception:
+                continue
+            if px <= 0.0:
+                continue
+            best_price = px if best_price is None else max(best_price, px)
+
+        return best_price
+
+    def _cashout_with_limit_sell_ladder(
+        self,
+        token_id: str,
+        shares: float,
+    ) -> Optional[CashoutResult]:
+        max_steps = 5
+        bump_bps = 50  # 0.50% down per retry
+
+        try:
+            book = self.client.get_order_book(token_id)
+            best_bid = self._extract_best_bid_price(book)
+        except Exception as exc:
+            return CashoutResult(
+                token_id=token_id,
+                requested_shares=shares,
+                order_id=None,
+                ok=False,
+                error=f"limit-sell fallback failed to fetch orderbook: {exc}",
+            )
+
+        if best_bid is None or best_bid <= 0.0:
+            return CashoutResult(
+                token_id=token_id,
+                requested_shares=shares,
+                order_id=None,
+                ok=False,
+                error="limit-sell fallback unavailable: no best bid",
+            )
+
+        for step in range(max_steps):
+            price = best_bid * (1.0 - (step * bump_bps / 10_000.0))
+            price = max(0.0001, min(0.9999, price))
+
+            try:
+                order_args = OrderArgs(token_id=token_id, price=price, size=shares, side=SELL)
+                signed = self.client.create_order(order_args)
+                posted = self.client.post_order(signed, OrderType.GTC)
+                order_id = posted.get("orderID") if isinstance(posted, dict) else None
+                return CashoutResult(
+                    token_id=token_id,
+                    requested_shares=shares,
+                    order_id=order_id,
+                    ok=True,
+                )
+            except Exception:
+                continue
+
+        return CashoutResult(
+            token_id=token_id,
+            requested_shares=shares,
+            order_id=None,
+            ok=False,
+            error="limit-sell fallback exhausted bid ladder",
         )
 
     def preflight_before_new_pair(

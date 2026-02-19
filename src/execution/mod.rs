@@ -801,9 +801,11 @@ impl Trader {
             let eth_shares = state.total_eth_shares(&opportunity.eth_condition_id);
             let btc_shares = state.total_btc_shares(&opportunity.btc_condition_id);
             info!(
-                "📌 POSITION TRACKER | pair={} eth_shares={:.2} btc_shares={:.2} imbalance={:.2} direction_count={}",
+                "📌 POSITION TRACKER | pair={} leg_a_condition={} tracked_leg_a_shares={:.2} leg_b_condition={} tracked_leg_b_shares={:.2} imbalance={:.2} direction_count={}",
                 opportunity.pair_label,
+                opportunity.eth_condition_id,
                 eth_shares,
+                opportunity.btc_condition_id,
                 btc_shares,
                 eth_shares - btc_shares,
                 fmt_count(trade_limit, direction_count)

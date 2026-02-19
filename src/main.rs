@@ -13,7 +13,13 @@ use anyhow::Result;
 use clap::Parser;
 use config::{Args, Config};
 use log::{info, warn};
+use rust_decimal::prelude::ToPrimitive;
+
+use crate::domain::ArbitrageOpportunity;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::config::WalletConfig;
 use cache::PriceCache;
@@ -50,6 +56,24 @@ fn env_bool_any_optional(keys: &[&str]) -> Option<bool> {
         }
     }
     None
+}
+
+fn opportunity_dedupe_ms_from_env() -> u64 {
+    std::env::var("OPPORTUNITY_DEDUPE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1500)
+}
+
+fn opportunity_signature(opp: &ArbitrageOpportunity) -> String {
+    format!(
+        "{}|{}|{}|{:.4}|{:.4}",
+        opp.pair_label,
+        opp.eth_condition_id,
+        opp.btc_condition_id,
+        opp.eth_up_price.to_f64().unwrap_or_default(),
+        opp.btc_down_price.to_f64().unwrap_or_default()
+    )
 }
 
 fn selected_pair_config() -> Result<PairConfig> {
@@ -252,6 +276,8 @@ async fn main() -> Result<()> {
         wallet_config,
         Some(signer),
     ));
+    let recent_opportunities: Arc<Mutex<HashMap<String, Instant>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let ws_url = config.polymarket.ws_url.clone();
     let mut current_period = current_15m_period();
@@ -308,12 +334,14 @@ async fn main() -> Result<()> {
         let monitor_handle = tokio::spawn({
             let detector = detector.clone();
             let trader = trader.clone();
+            let recent_opportunities = recent_opportunities.clone();
 
             async move {
                 monitor
                     .start(move |snapshot| {
                         let detector = detector.clone();
                         let trader = trader.clone();
+                        let recent_opportunities = recent_opportunities.clone();
 
                         async move {
                             let opportunities = detector.detect_opportunities(&snapshot);
@@ -323,6 +351,31 @@ async fn main() -> Result<()> {
                             }
 
                             for (i, opp) in opportunities.iter().enumerate() {
+                                let dedupe_ms = opportunity_dedupe_ms_from_env();
+                                let sig = opportunity_signature(opp);
+                                let now = Instant::now();
+
+                                if dedupe_ms > 0 {
+                                    let mut seen = recent_opportunities.lock().await;
+                                    if let Some(last_seen) = seen.get(&sig) {
+                                        if now.duration_since(*last_seen)
+                                            < Duration::from_millis(dedupe_ms)
+                                        {
+                                            info!(
+                                                "🔁 Duplicate opportunity suppressed ({}ms window): {}",
+                                                dedupe_ms, opp.pair_label
+                                            );
+                                            continue;
+                                        }
+                                    }
+
+                                    seen.insert(sig, now);
+                                    seen.retain(|_, ts| {
+                                        now.duration_since(*ts)
+                                            < Duration::from_millis(dedupe_ms.saturating_mul(4))
+                                    });
+                                }
+
                                 info!(
                                     "📋 Processing opportunity {} of {}",
                                     i + 1,
