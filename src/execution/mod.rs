@@ -9,7 +9,7 @@ use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConf
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
@@ -44,6 +44,10 @@ struct ExecutionEnv {
     paired_execution_mode: PairedExecutionMode,
     tiered_parallel_ratio_threshold: f64,
     max_signal_age_ms: u128,
+    opportunity_cooldown_ms: u128,
+    opportunity_price_round_dp: u32,
+    depth_slippage_check_enabled: bool,
+    max_book_slippage_bps: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +157,24 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(800),
+        opportunity_cooldown_ms: std::env::var("OPPORTUNITY_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(5_000),
+        opportunity_price_round_dp: std::env::var("OPPORTUNITY_PRICE_ROUND_DP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+            .min(6),
+        depth_slippage_check_enabled: std::env::var("DEPTH_SLIPPAGE_CHECK_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .eq_ignore_ascii_case("true"),
+        max_book_slippage_bps: std::env::var("MAX_BOOK_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(60.0)
+            .max(0.0),
     }
 }
 
@@ -229,6 +251,22 @@ fn max_signal_age_ms_from_env() -> u128 {
     env_settings().max_signal_age_ms
 }
 
+fn opportunity_cooldown_ms_from_env() -> u128 {
+    env_settings().opportunity_cooldown_ms
+}
+
+fn opportunity_price_round_dp_from_env() -> u32 {
+    env_settings().opportunity_price_round_dp
+}
+
+fn depth_slippage_check_enabled_from_env() -> bool {
+    env_settings().depth_slippage_check_enabled
+}
+
+fn max_book_slippage_bps_from_env() -> f64 {
+    env_settings().max_book_slippage_bps
+}
+
 fn balance_cache_ttl_seconds_from_env() -> u64 {
     std::env::var("BALANCE_CACHE_TTL_SECONDS")
         .ok()
@@ -280,6 +318,7 @@ struct ExecutionState {
     trade_count_by_direction: HashMap<String, usize>,
     shares_by_condition: HashMap<String, f64>,
     total_effective_cost_by_condition: HashMap<String, f64>,
+    recent_opportunities: HashMap<String, Instant>,
 }
 
 impl ExecutionState {
@@ -289,7 +328,28 @@ impl ExecutionState {
             self.trade_count_by_direction.clear();
             self.shares_by_condition.clear();
             self.total_effective_cost_by_condition.clear();
+            self.recent_opportunities.clear();
         }
+    }
+
+    fn should_skip_opportunity(
+        &mut self,
+        fingerprint: &str,
+        cooldown_ms: u128,
+        now: Instant,
+    ) -> bool {
+        self.recent_opportunities
+            .retain(|_, seen_at| now.duration_since(*seen_at).as_millis() <= cooldown_ms);
+
+        if let Some(last_seen) = self.recent_opportunities.get(fingerprint) {
+            if now.duration_since(*last_seen).as_millis() <= cooldown_ms {
+                return true;
+            }
+        }
+
+        self.recent_opportunities
+            .insert(fingerprint.to_string(), now);
+        false
     }
 
     fn direction_count(&self, direction: &str) -> usize {
@@ -403,6 +463,18 @@ pub struct Trader {
 }
 
 impl Trader {
+    fn opportunity_fingerprint(opportunity: &ArbitrageOpportunity) -> String {
+        let dp = opportunity_price_round_dp_from_env();
+        format!(
+            "{}|{:.*}|{:.*}",
+            opportunity.pair_label,
+            dp as usize,
+            opportunity.eth_up_price,
+            dp as usize,
+            opportunity.btc_down_price
+        )
+    }
+
     fn window_key(opportunity: &ArbitrageOpportunity) -> String {
         let mut ids = vec![
             opportunity.eth_condition_id.clone(),
@@ -444,6 +516,69 @@ impl Trader {
                 ));
             }
         }
+
+        Ok(())
+    }
+
+    async fn validate_depth_and_slippage(
+        &self,
+        opportunity: &ArbitrageOpportunity,
+        shares_per_leg: f64,
+    ) -> Result<()> {
+        if !depth_slippage_check_enabled_from_env() || shares_per_leg <= 0.0 {
+            return Ok(());
+        }
+
+        let max_slippage_bps = max_book_slippage_bps_from_env();
+        let (eth_book, btc_book) = tokio::try_join!(
+            crate::execution::orderbook::fetch_orderbook(&self.api, &opportunity.eth_up_token_id),
+            crate::execution::orderbook::fetch_orderbook(&self.api, &opportunity.btc_down_token_id),
+        )?;
+
+        let eth_avg = eth_book
+            .estimated_avg_buy_price(shares_per_leg)
+            .ok_or_else(|| {
+                anyhow!(
+                    "insufficient depth on ETH leg for {:.2} shares",
+                    shares_per_leg
+                )
+            })?;
+        let btc_avg = btc_book
+            .estimated_avg_buy_price(shares_per_leg)
+            .ok_or_else(|| {
+                anyhow!(
+                    "insufficient depth on BTC leg for {:.2} shares",
+                    shares_per_leg
+                )
+            })?;
+
+        let eth_quote = opportunity.eth_up_price.to_f64().unwrap_or_default();
+        let btc_quote = opportunity.btc_down_price.to_f64().unwrap_or_default();
+
+        if eth_quote <= 0.0 || btc_quote <= 0.0 {
+            return Err(anyhow!("invalid quoted ask for depth/slippage check"));
+        }
+
+        let eth_slip_bps = ((eth_avg / eth_quote) - 1.0) * 10_000.0;
+        let btc_slip_bps = ((btc_avg / btc_quote) - 1.0) * 10_000.0;
+
+        if eth_slip_bps > max_slippage_bps || btc_slip_bps > max_slippage_bps {
+            return Err(anyhow!(
+                "depth/slippage guard rejected trade: eth_slip_bps={:.2} btc_slip_bps={:.2} max={:.2}",
+                eth_slip_bps,
+                btc_slip_bps,
+                max_slippage_bps
+            ));
+        }
+
+        info!(
+            "📚 Depth validated | shares={:.2} eth_avg={:.4} btc_avg={:.4} eth_slip_bps={:.2} btc_slip_bps={:.2}",
+            shares_per_leg,
+            eth_avg,
+            btc_avg,
+            eth_slip_bps,
+            btc_slip_bps
+        );
 
         Ok(())
     }
@@ -797,6 +932,17 @@ impl Trader {
             let mut state = self.execution_state.lock().await;
             state.reset_for_window(window_key);
 
+            let fingerprint = Self::opportunity_fingerprint(opportunity);
+            let now = Instant::now();
+            let cooldown_ms = opportunity_cooldown_ms_from_env();
+            if state.should_skip_opportunity(&fingerprint, cooldown_ms, now) {
+                warn!(
+                    "⏱️ Opportunity skipped by cooldown ({}ms): {}",
+                    cooldown_ms, fingerprint
+                );
+                return Ok(());
+            }
+
             let direction_count = state.direction_count(&opportunity.pair_label);
             let eth_shares = state.total_eth_shares(&opportunity.eth_condition_id);
             let btc_shares = state.total_btc_shares(&opportunity.btc_condition_id);
@@ -1025,6 +1171,14 @@ impl Trader {
         if !rebalance_only {
             let state = self.execution_state.lock().await;
             if let Err(err) = Self::can_open_paired_position(&state, opportunity, units) {
+                warn!(
+                    "🚫 TRADE SKIP | pair={} reason={}",
+                    opportunity.pair_label, err
+                );
+                return Ok(());
+            }
+
+            if let Err(err) = self.validate_depth_and_slippage(opportunity, units).await {
                 warn!(
                     "🚫 TRADE SKIP | pair={} reason={}",
                     opportunity.pair_label, err

@@ -4,14 +4,16 @@ import os
 import threading
 import re
 import traceback
+import time
 from math import floor
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from executor.position_guard import PositionGuard
+from executor.trade_journal import JournalEntry, TradeJournal
 from executor.telegram_notifier import (
     TelegramNotifier,
     TradeResult,
@@ -23,7 +25,15 @@ try:
     from eth_account import Account
     from eth_utils import is_address, to_checksum_address
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
+    from py_clob_client.clob_types import (
+        ApiCreds,
+        AssetType,
+        BalanceAllowanceParams,
+        MarketOrderArgs,
+        OpenOrderParams,
+        OrderArgs,
+        OrderType,
+    )
     from py_clob_client.order_builder.constants import BUY, SELL
 except Exception as exc:
     raise RuntimeError(
@@ -46,6 +56,12 @@ MIN_SHARES = float(os.getenv("MIN_SHARES", "5"))
 MAX_SHARES_RAW = os.getenv("MAX_SHARES", "").strip()
 MAX_SHARES = float(MAX_SHARES_RAW) if MAX_SHARES_RAW else None
 STRICT_SHARE_BOUNDS = os.getenv("STRICT_SHARE_BOUNDS", "true").strip().lower() == "true"
+FILL_CONFIRMATION_ENABLED = os.getenv("FILL_CONFIRMATION_ENABLED", "true").strip().lower() == "true"
+FILL_CONFIRMATION_REQUIRED = os.getenv("FILL_CONFIRMATION_REQUIRED", "true").strip().lower() == "true"
+FILL_CONFIRMATION_TIMEOUT_MS = int(os.getenv("FILL_CONFIRMATION_TIMEOUT_MS", "3000"))
+FILL_CONFIRMATION_POLL_MS = int(os.getenv("FILL_CONFIRMATION_POLL_MS", "250"))
+MIN_FILL_RATIO = float(os.getenv("MIN_FILL_RATIO", "0.95"))
+TRADE_JOURNAL_DB_PATH = os.getenv("TRADE_JOURNAL_DB_PATH", "data/trade_journal.sqlite3")
 
 app = FastAPI(title="polymarket-executor", version="1.0.4")
 
@@ -62,6 +78,9 @@ class ExecuteOrderResponse(BaseModel):
     ok: bool
     order_id: Optional[str] = None
     error: Optional[str] = None
+    fill_confirmed: bool = False
+    fill_status: Optional[str] = None
+    observed_shares: Optional[float] = None
 
 
 class CashoutRequest(BaseModel):
@@ -214,6 +233,79 @@ def resolve_fee_rate_bps(market_fee_bps: Optional[int] = None) -> Optional[int]:
 
     return market_fee_bps
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_token_balance_shares(token_id: str) -> float:
+    try:
+        resp = CLIENT.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        if isinstance(resp, dict):
+            for key in ("balance", "available", "value"):
+                if key in resp:
+                    return _safe_float(resp.get(key), 0.0)
+    except Exception as exc:
+        print(f"[executor] balance check failed for token {token_id}: {exc}")
+    return 0.0
+
+
+def get_open_orders_for_token(token_id: str) -> List[Dict[str, Any]]:
+    try:
+        orders = CLIENT.get_orders(OpenOrderParams(asset_id=token_id))
+        if isinstance(orders, list):
+            return [o for o in orders if isinstance(o, dict)]
+    except Exception as exc:
+        print(f"[executor] get_orders failed for token {token_id}: {exc}")
+    return []
+
+
+def confirm_fill_post_submit(
+    token_id: str,
+    side: int,
+    order_id: Optional[str],
+    pre_shares: float,
+    expected_shares: float,
+) -> Tuple[bool, str, float]:
+    if not FILL_CONFIRMATION_ENABLED:
+        return True, "disabled", pre_shares
+
+    expected_shares = max(0.0, float(expected_shares))
+    min_expected = expected_shares * max(0.0, min(1.0, MIN_FILL_RATIO))
+
+    timeout_ms = max(250, FILL_CONFIRMATION_TIMEOUT_MS)
+    poll_ms = max(50, FILL_CONFIRMATION_POLL_MS)
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+
+    last_shares = pre_shares
+    while time.monotonic() < deadline:
+        last_shares = get_token_balance_shares(token_id)
+
+        if side == BUY:
+            delta = max(0.0, last_shares - pre_shares)
+            if delta >= min_expected:
+                return True, f"confirmed_balance_delta={delta:.4f}", last_shares
+        else:
+            delta = max(0.0, pre_shares - last_shares)
+            if delta >= min_expected:
+                return True, f"confirmed_balance_delta={delta:.4f}", last_shares
+
+        # Secondary signal: order no longer open means filled/cancelled/expired.
+        if order_id:
+            open_orders = get_open_orders_for_token(token_id)
+            open_ids = {str(o.get("id") or o.get("orderID") or "") for o in open_orders}
+            if str(order_id) not in open_ids:
+                return True, "order_not_open", last_shares
+
+        time.sleep(poll_ms / 1000.0)
+
+    return False, "confirmation_timeout", last_shares
+
+
 def init_client() -> ClobClient:
     private_key, funder = resolve_funder_address(PRIVATE_KEY, PROXY_WALLET)
     signer = Account.from_key(private_key).address
@@ -320,6 +412,7 @@ class TelegramDispatchRunner:
 
 CLIENT = init_client()
 GUARD = PositionGuard(CLIENT, MIN_SHARES, MAX_SHARES)
+JOURNAL = TradeJournal(TRADE_JOURNAL_DB_PATH)
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "true"
 
 if TELEGRAM_ENABLED:
@@ -393,11 +486,26 @@ def health():
     return {"ok": True, "mode": "execution-only"}
 
 
+@app.get("/journal/summary")
+def journal_summary():
+    return JOURNAL.summary()
+
+
+@app.get("/journal/recent")
+def journal_recent(limit: int = 50):
+    return {"rows": JOURNAL.recent(limit)}
+
+
 @app.post("/execute", response_model=ExecuteOrderResponse)
 def execute(req: ExecuteOrderRequest):
+    side_name = req.side
+    side = BUY if req.side == "BUY" else SELL
+    expected_shares = 0.0
+    pre_shares = get_token_balance_shares(req.token_id)
+
     try:
-        side = BUY if req.side == "BUY" else SELL
         clamped_size = clamp_order_size(req.size_usdc, side)
+        expected_shares = clamped_size / req.price
         order_args = build_order_args(
             token_id=req.token_id,
             side=side,
@@ -435,9 +543,64 @@ def execute(req: ExecuteOrderRequest):
         if isinstance(result, dict):
             order_id = result.get("orderID") or result.get("order_id")
 
-        return ExecuteOrderResponse(ok=True, order_id=order_id)
+        fill_confirmed, fill_status, observed_shares = confirm_fill_post_submit(
+            token_id=req.token_id,
+            side=side,
+            order_id=order_id,
+            pre_shares=pre_shares,
+            expected_shares=expected_shares,
+        )
+
+        JOURNAL.insert(
+            JournalEntry(
+                event_type="execute",
+                token_id=req.token_id,
+                side=side_name,
+                price=req.price,
+                size_usdc=clamped_size,
+                order_id=order_id,
+                status="filled" if fill_confirmed else "timeout",
+                fill_confirmed=fill_confirmed,
+                fill_reason=fill_status,
+            )
+        )
+
+        if not fill_confirmed and FILL_CONFIRMATION_REQUIRED:
+            try:
+                if order_id:
+                    CLIENT.cancel_orders([order_id])
+            except Exception as cancel_exc:
+                print(f"[executor] failed to cancel unconfirmed order {order_id}: {cancel_exc}")
+
+            raise HTTPException(
+                status_code=408,
+                detail=f"order submitted but fill unconfirmed: {fill_status}",
+            )
+
+        return ExecuteOrderResponse(
+            ok=True,
+            order_id=order_id,
+            fill_confirmed=fill_confirmed,
+            fill_status=fill_status,
+            observed_shares=observed_shares,
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         traceback.print_exc()
+        JOURNAL.insert(
+            JournalEntry(
+                event_type="execute",
+                token_id=req.token_id,
+                side=side_name,
+                price=req.price,
+                size_usdc=req.size_usdc,
+                order_id=None,
+                status="error",
+                fill_confirmed=False,
+                fill_reason=str(exc),
+            )
+        )
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -474,6 +637,19 @@ def cashout(req: CashoutRequest):
                 NOTIFIER.send_unwind_failed(unwind_info, result.error or "unknown unwind error")
             )
 
+        JOURNAL.insert(
+            JournalEntry(
+                event_type="cashout",
+                token_id=result.token_id,
+                side="SELL",
+                price=0.0,
+                size_usdc=float(result.requested_shares or 0.0),
+                order_id=result.order_id,
+                status="filled" if result.ok else "error",
+                fill_confirmed=bool(result.ok),
+                fill_reason=result.error,
+            )
+        )
         return CashoutResponse(
             ok=result.ok,
             token_id=result.token_id,
