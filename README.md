@@ -73,10 +73,21 @@ ARBITRAGE_SUM_TOLERANCE=0.02
 TRADE_FEE_BPS=100
 # optional: slippage safety buffer in bps
 SLIPPAGE_BPS=15
+# optional: multi-level depth/slippage guard before execution
+DEPTH_SLIPPAGE_CHECK_ENABLED=true
+MAX_BOOK_SLIPPAGE_BPS=60
 # optional: dedupe identical opportunities for this many milliseconds
 OPPORTUNITY_COOLDOWN_MS=5000
 # optional: fingerprint rounding precision for dedupe (max 6)
 OPPORTUNITY_PRICE_ROUND_DP=3
+# optional: post-submit fill verification in executor
+FILL_CONFIRMATION_ENABLED=true
+FILL_CONFIRMATION_REQUIRED=true
+FILL_CONFIRMATION_TIMEOUT_MS=3000
+FILL_CONFIRMATION_POLL_MS=250
+MIN_FILL_RATIO=0.95
+# optional: persistent sqlite trade journal path
+TRADE_JOURNAL_DB_PATH=data/trade_journal.sqlite3
 ```
 
 2. Run migration/setup script:
@@ -243,3 +254,10 @@ If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
 - avoid surrounding quotes/spaces in env values,
 - verify it is Polygon mainnet (`chainId=137`),
 - optionally set `POLYGON_RPC_URL` as an additional fallback.
+
+
+### Executor trade journal
+
+- `GET /journal/summary` returns aggregate execution stats from SQLite.
+- `GET /journal/recent?limit=50` returns recent journal rows.
+
