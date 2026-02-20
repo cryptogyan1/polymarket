@@ -9,7 +9,7 @@ use crate::config::{Config, PositionSizing, TradeMode, TradingConfig, WalletConf
 use crate::domain::order::Side;
 use crate::domain::*;
 use crate::wallet::signer::{ClobOrder, WalletSigner};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ethers::types::Address;
 use ethers::types::{H256, U256};
 use ethers::utils::keccak256;
@@ -44,6 +44,8 @@ struct ExecutionEnv {
     paired_execution_mode: PairedExecutionMode,
     tiered_parallel_ratio_threshold: f64,
     max_signal_age_ms: u128,
+    opportunity_cooldown_ms: u128,
+    opportunity_price_round_dp: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +155,15 @@ fn load_execution_env() -> ExecutionEnv {
             .ok()
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(800),
+        opportunity_cooldown_ms: std::env::var("OPPORTUNITY_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(5_000),
+        opportunity_price_round_dp: std::env::var("OPPORTUNITY_PRICE_ROUND_DP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+            .min(6),
     }
 }
 
@@ -229,6 +240,14 @@ fn max_signal_age_ms_from_env() -> u128 {
     env_settings().max_signal_age_ms
 }
 
+fn opportunity_cooldown_ms_from_env() -> u128 {
+    env_settings().opportunity_cooldown_ms
+}
+
+fn opportunity_price_round_dp_from_env() -> u32 {
+    env_settings().opportunity_price_round_dp
+}
+
 fn balance_cache_ttl_seconds_from_env() -> u64 {
     std::env::var("BALANCE_CACHE_TTL_SECONDS")
         .ok()
@@ -280,6 +299,7 @@ struct ExecutionState {
     trade_count_by_direction: HashMap<String, usize>,
     shares_by_condition: HashMap<String, f64>,
     total_effective_cost_by_condition: HashMap<String, f64>,
+    recent_opportunities: HashMap<String, Instant>,
 }
 
 impl ExecutionState {
@@ -289,7 +309,28 @@ impl ExecutionState {
             self.trade_count_by_direction.clear();
             self.shares_by_condition.clear();
             self.total_effective_cost_by_condition.clear();
+            self.recent_opportunities.clear();
         }
+    }
+
+    fn should_skip_opportunity(
+        &mut self,
+        fingerprint: &str,
+        cooldown_ms: u128,
+        now: Instant,
+    ) -> bool {
+        self.recent_opportunities
+            .retain(|_, seen_at| now.duration_since(*seen_at).as_millis() <= cooldown_ms);
+
+        if let Some(last_seen) = self.recent_opportunities.get(fingerprint) {
+            if now.duration_since(*last_seen).as_millis() <= cooldown_ms {
+                return true;
+            }
+        }
+
+        self.recent_opportunities
+            .insert(fingerprint.to_string(), now);
+        false
     }
 
     fn direction_count(&self, direction: &str) -> usize {
@@ -403,6 +444,18 @@ pub struct Trader {
 }
 
 impl Trader {
+    fn opportunity_fingerprint(opportunity: &ArbitrageOpportunity) -> String {
+        let dp = opportunity_price_round_dp_from_env();
+        format!(
+            "{}|{:.*}|{:.*}",
+            opportunity.pair_label,
+            dp as usize,
+            opportunity.eth_up_price,
+            dp as usize,
+            opportunity.btc_down_price
+        )
+    }
+
     fn window_key(opportunity: &ArbitrageOpportunity) -> String {
         let mut ids = vec![
             opportunity.eth_condition_id.clone(),
@@ -796,6 +849,17 @@ impl Trader {
         let (direction_count, rebalance_plan, trim_plan) = {
             let mut state = self.execution_state.lock().await;
             state.reset_for_window(window_key);
+
+            let fingerprint = Self::opportunity_fingerprint(opportunity);
+            let now = Instant::now();
+            let cooldown_ms = opportunity_cooldown_ms_from_env();
+            if state.should_skip_opportunity(&fingerprint, cooldown_ms, now) {
+                warn!(
+                    "⏱️ Opportunity skipped by cooldown ({}ms): {}",
+                    cooldown_ms, fingerprint
+                );
+                return Ok(());
+            }
 
             let direction_count = state.direction_count(&opportunity.pair_label);
             let eth_shares = state.total_eth_shares(&opportunity.eth_condition_id);

@@ -73,6 +73,10 @@ ARBITRAGE_SUM_TOLERANCE=0.02
 TRADE_FEE_BPS=100
 # optional: slippage safety buffer in bps
 SLIPPAGE_BPS=15
+# optional: dedupe identical opportunities for this many milliseconds
+OPPORTUNITY_COOLDOWN_MS=5000
+# optional: fingerprint rounding precision for dedupe (max 6)
+OPPORTUNITY_PRICE_ROUND_DP=3
 ```
 
 2. Run migration/setup script:
