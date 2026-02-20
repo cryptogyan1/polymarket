@@ -88,6 +88,12 @@ FILL_CONFIRMATION_POLL_MS=250
 MIN_FILL_RATIO=0.95
 # optional: persistent sqlite trade journal path
 TRADE_JOURNAL_DB_PATH=data/trade_journal.sqlite3
+# optional: bid-depth-aware SELL unwind ladder before market fallback
+UNWIND_LADDER_ENABLED=true
+UNWIND_LADDER_MAX_LEVELS=4
+UNWIND_LADDER_LIQUIDITY_FACTOR=0.9
+UNWIND_MIN_BID_PRICE=0.02
+UNWIND_MIN_REMAINING_SHARES=0.5
 ```
 
 2. Run migration/setup script:
