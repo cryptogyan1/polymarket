@@ -27,6 +27,38 @@ impl OrderBook {
             .min_by(|(price_a, _), (price_b, _)| price_a.total_cmp(price_b))
             .cloned()
     }
+
+    pub fn estimated_buy_cost(&self, target_shares: f64) -> Option<f64> {
+        if target_shares <= 0.0 {
+            return Some(0.0);
+        }
+
+        let mut remaining = target_shares;
+        let mut total_cost = 0.0;
+
+        for (price, size) in &self.asks {
+            if remaining <= 0.0 {
+                break;
+            }
+            let fill = remaining.min(*size);
+            total_cost += fill * *price;
+            remaining -= fill;
+        }
+
+        if remaining > 0.0 {
+            None
+        } else {
+            Some(total_cost)
+        }
+    }
+
+    pub fn estimated_avg_buy_price(&self, target_shares: f64) -> Option<f64> {
+        if target_shares <= 0.0 {
+            return Some(0.0);
+        }
+        self.estimated_buy_cost(target_shares)
+            .map(|cost| cost / target_shares)
+    }
 }
 
 #[derive(Debug, Deserialize)]

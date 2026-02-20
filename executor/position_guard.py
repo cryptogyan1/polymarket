@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import requests
 
 from py_clob_client.clob_types import (
     AssetType,
     BalanceAllowanceParams,
     MarketOrderArgs,
     OpenOrderParams,
+    OrderArgs,
     OrderType,
 )
 from py_clob_client.order_builder.constants import SELL
+
+
+CLOB_URL = os.getenv("POLY_CLOB_URL", "https://clob.polymarket.com").rstrip("/")
+UNWIND_LADDER_ENABLED = os.getenv("UNWIND_LADDER_ENABLED", "true").strip().lower() == "true"
+UNWIND_LADDER_MAX_LEVELS = max(1, int(os.getenv("UNWIND_LADDER_MAX_LEVELS", "4")))
+UNWIND_LADDER_LIQUIDITY_FACTOR = max(0.1, min(1.0, float(os.getenv("UNWIND_LADDER_LIQUIDITY_FACTOR", "0.9"))))
+UNWIND_MIN_BID_PRICE = max(0.001, float(os.getenv("UNWIND_MIN_BID_PRICE", "0.02")))
+UNWIND_MIN_REMAINING_SHARES = max(0.0, float(os.getenv("UNWIND_MIN_REMAINING_SHARES", "0.5")))
 
 
 @dataclass
@@ -79,6 +91,82 @@ class PositionGuard:
                 print(f"[position_guard] Error cancelling orders for {token_id}: {exc}")
         return cancelled
 
+    def _fetch_orderbook_bids(self, token_id: str) -> List[Tuple[float, float]]:
+        try:
+            resp = requests.get(f"{CLOB_URL}/book", params={"token_id": token_id}, timeout=1.5)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            print(f"[position_guard] orderbook fetch failed for {token_id}: {exc}")
+            return []
+
+        raw_bids = payload.get("bids") if isinstance(payload, dict) else None
+        if not isinstance(raw_bids, list):
+            return []
+
+        parsed: List[Tuple[float, float]] = []
+        for lvl in raw_bids:
+            if not isinstance(lvl, dict):
+                continue
+            try:
+                p = float(lvl.get("price", 0.0))
+                s = float(lvl.get("size", 0.0))
+            except Exception:
+                continue
+            if p > 0.0 and s > 0.0:
+                parsed.append((p, s))
+
+        parsed.sort(key=lambda x: x[0], reverse=True)
+        return parsed
+
+    def _place_limit_sell(self, token_id: str, shares: float, price: float, fok: bool = True) -> Optional[str]:
+        if shares <= 0.0 or price <= 0.0:
+            return None
+        args = OrderArgs(token_id=token_id, price=float(price), size=float(shares), side=SELL)
+        signed = self.client.create_order(args)
+        posted = self.client.post_order(signed, OrderType.FOK if fok else OrderType.GTC)
+        if isinstance(posted, dict):
+            return posted.get("orderID") or posted.get("order_id") or posted.get("id")
+        return None
+
+    def _laddered_unwind(self, token_id: str, target_qty: float) -> Tuple[float, Optional[str], List[str]]:
+        bids = self._fetch_orderbook_bids(token_id)
+        if not bids:
+            return 0.0, None, ["no_bids"]
+
+        sold = 0.0
+        last_order_id: Optional[str] = None
+        errors: List[str] = []
+        levels = 0
+
+        for price, size in bids:
+            if levels >= UNWIND_LADDER_MAX_LEVELS:
+                break
+            if price < UNWIND_MIN_BID_PRICE:
+                continue
+
+            remaining = max(0.0, target_qty - sold)
+            if remaining <= UNWIND_MIN_REMAINING_SHARES:
+                break
+
+            qty = min(remaining, size * UNWIND_LADDER_LIQUIDITY_FACTOR)
+            if qty <= 0.0:
+                continue
+
+            try:
+                oid = self._place_limit_sell(token_id, qty, price, fok=True)
+                last_order_id = oid or last_order_id
+                sold += qty
+                levels += 1
+                print(
+                    f"[position_guard] ladder unwind success token={token_id[:10]}.. qty={qty:.4f} price={price:.4f}"
+                )
+            except Exception as exc:
+                errors.append(str(exc))
+                levels += 1
+
+        return sold, last_order_id, errors
+
     def cashout_market(
         self,
         token_id: str,
@@ -122,19 +210,41 @@ class PositionGuard:
                 )
 
             try:
+                ladder_order_id: Optional[str] = None
+                remaining_qty = adjusted_qty
+
+                if UNWIND_LADDER_ENABLED:
+                    sold_qty, ladder_order_id, ladder_errors = self._laddered_unwind(
+                        token_id, adjusted_qty
+                    )
+                    remaining_qty = max(0.0, adjusted_qty - sold_qty)
+                    if ladder_errors:
+                        print(
+                            f"[position_guard] ladder unwind had {len(ladder_errors)} errors for {token_id}: "
+                            f"{ladder_errors[0]}"
+                        )
+
+                if remaining_qty <= UNWIND_MIN_REMAINING_SHARES:
+                    return CashoutResult(
+                        token_id=token_id,
+                        requested_shares=adjusted_qty,
+                        order_id=ladder_order_id,
+                        ok=True,
+                    )
+
                 market_args = MarketOrderArgs(
                     token_id=token_id,
-                    amount=adjusted_qty,
+                    amount=remaining_qty,
                     side=SELL,
                     order_type=OrderType.GTC,
                 )
                 signed = self.client.create_market_order(market_args)
                 posted = self.client.post_order(signed, market_args.order_type)
-                order_id = posted.get("orderID") if isinstance(posted, dict) else None
+                market_order_id = posted.get("orderID") if isinstance(posted, dict) else None
                 return CashoutResult(
                     token_id=token_id,
                     requested_shares=adjusted_qty,
-                    order_id=order_id,
+                    order_id=market_order_id or ladder_order_id,
                     ok=True,
                 )
             except Exception as exc:
