@@ -13,7 +13,12 @@ use anyhow::Result;
 use clap::Parser;
 use config::{Args, Config};
 use log::{info, warn};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{watch, Mutex};
 
 use crate::config::WalletConfig;
 use cache::PriceCache;
@@ -103,6 +108,217 @@ fn current_15m_period() -> u64 {
         .unwrap()
         .as_secs();
     (now / 900) * 900
+}
+
+#[derive(Debug, Clone)]
+struct SimulatedTrade {
+    id: u64,
+    opened_at: std::time::Instant,
+    pair_label: String,
+    shares: Decimal,
+    entry_total: Decimal,
+    eth_token_id: String,
+    btc_token_id: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SimulationStats {
+    seen_signals: u64,
+    opened_trades: u64,
+    closed_trades: u64,
+    wins: u64,
+    losses: u64,
+    failed_trades: u64,
+    failed_legs: u64,
+    missing_data_events: u64,
+    low_liquidity_skips: u64,
+    gross_pnl_usd: Decimal,
+    by_failure_reason: HashMap<String, u64>,
+    by_pair_opened: HashMap<String, u64>,
+}
+
+struct SimulationEngine {
+    stats: SimulationStats,
+    open_positions: Vec<SimulatedTrade>,
+    next_id: u64,
+    hold_seconds: u64,
+    stake_per_trade: Decimal,
+}
+
+impl SimulationEngine {
+    fn new(hold_seconds: u64, stake_per_trade: Decimal) -> Self {
+        Self {
+            stats: SimulationStats::default(),
+            open_positions: Vec::new(),
+            next_id: 1,
+            hold_seconds,
+            stake_per_trade,
+        }
+    }
+
+    fn register_opportunity(&mut self, opp: &domain::ArbitrageOpportunity) {
+        self.stats.seen_signals += 1;
+        if opp.total_cost <= dec!(0) || opp.total_cost >= dec!(1.2) {
+            self.register_failed_trade("invalid_total_cost");
+            return;
+        }
+
+        if opp.eth_leg_ask_size < dec!(1) || opp.btc_leg_ask_size < dec!(1) {
+            self.stats.low_liquidity_skips += 1;
+            self.register_failed_trade("entry_liquidity_too_low");
+            return;
+        }
+
+        let shares = self.stake_per_trade / opp.total_cost;
+        if shares > opp.eth_leg_ask_size || shares > opp.btc_leg_ask_size {
+            self.stats.low_liquidity_skips += 1;
+            self.register_failed_trade("insufficient_ask_depth_for_100usd");
+            self.stats.failed_legs += 1;
+            return;
+        }
+
+        let trade = SimulatedTrade {
+            id: self.next_id,
+            opened_at: std::time::Instant::now(),
+            pair_label: opp.pair_label.clone(),
+            shares,
+            entry_total: opp.total_cost,
+            eth_token_id: opp.eth_up_token_id.clone(),
+            btc_token_id: opp.btc_down_token_id.clone(),
+        };
+        self.next_id += 1;
+        self.stats.opened_trades += 1;
+        *self
+            .stats
+            .by_pair_opened
+            .entry(trade.pair_label.clone())
+            .or_insert(0) += 1;
+        self.open_positions.push(trade);
+    }
+
+    fn settle_due_positions(&mut self, snapshot: &monitor::MarketSnapshot) {
+        let mut remaining = Vec::with_capacity(self.open_positions.len());
+        let open_positions = std::mem::take(&mut self.open_positions);
+
+        for trade in open_positions {
+            if trade.opened_at.elapsed() < Duration::from_secs(self.hold_seconds) {
+                remaining.push(trade);
+                continue;
+            }
+
+            let Some(eth_bid) = token_bid(snapshot, &trade.eth_token_id) else {
+                self.stats.missing_data_events += 1;
+                self.stats.failed_legs += 1;
+                self.register_failed_trade("missing_eth_bid_on_exit");
+                continue;
+            };
+
+            let Some(btc_bid) = token_bid(snapshot, &trade.btc_token_id) else {
+                self.stats.missing_data_events += 1;
+                self.stats.failed_legs += 1;
+                self.register_failed_trade("missing_btc_bid_on_exit");
+                continue;
+            };
+
+            let exit_total = eth_bid + btc_bid;
+            let pnl = (exit_total - trade.entry_total) * trade.shares;
+            self.stats.closed_trades += 1;
+            self.stats.gross_pnl_usd += pnl;
+
+            if pnl > dec!(0) {
+                self.stats.wins += 1;
+            } else {
+                self.stats.losses += 1;
+            }
+
+            info!(
+                "🧪 [SIM] Closed trade #{} | {} | entry={:.4} exit={:.4} shares={:.2} pnl=${:.2}",
+                trade.id, trade.pair_label, trade.entry_total, exit_total, trade.shares, pnl
+            );
+        }
+
+        self.open_positions = remaining;
+    }
+
+    fn register_failed_trade(&mut self, reason: &str) {
+        self.stats.failed_trades += 1;
+        *self
+            .stats
+            .by_failure_reason
+            .entry(reason.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn final_report(&self) -> String {
+        let avg_pnl = if self.stats.closed_trades > 0 {
+            self.stats.gross_pnl_usd / Decimal::from(self.stats.closed_trades)
+        } else {
+            dec!(0)
+        };
+        let win_rate = if self.stats.closed_trades > 0 {
+            (self.stats.wins as f64 / self.stats.closed_trades as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        format!(
+            "\n================ SIMULATION REPORT ================\n\
+Mode: LIVE WS feed + simulated fills\n\
+Stake per trade: ${:.2}\n\
+Hold period: {}s\n\
+Signals seen: {}\n\
+Trades opened: {}\n\
+Trades closed: {}\n\
+Wins: {}\n\
+Losses: {}\n\
+Failed trades: {}\n\
+Failed legs: {}\n\
+Missing data events: {}\n\
+Low-liquidity skips: {}\n\
+Open positions left (force-closed as unresolved): {}\n\
+Gross PnL: ${:.2}\n\
+Average PnL/trade: ${:.2}\n\
+Win rate: {:.2}%\n\
+Failure reasons: {:?}\n\
+Opened by pair: {:?}\n\
+Fail-leg handling: If only one leg can be priced at exit, trade is marked failed_leg and excluded from PnL to avoid fake marking.\n\
+Mishap handling: Missing bids / bad totals / low depth are categorized, counted, and surfaced above.\n\
+===================================================",
+            self.stake_per_trade,
+            self.hold_seconds,
+            self.stats.seen_signals,
+            self.stats.opened_trades,
+            self.stats.closed_trades,
+            self.stats.wins,
+            self.stats.losses,
+            self.stats.failed_trades,
+            self.stats.failed_legs,
+            self.stats.missing_data_events,
+            self.stats.low_liquidity_skips,
+            self.open_positions.len(),
+            self.stats.gross_pnl_usd,
+            avg_pnl,
+            win_rate,
+            self.stats.by_failure_reason,
+            self.stats.by_pair_opened,
+        )
+    }
+}
+
+fn token_bid(snapshot: &monitor::MarketSnapshot, token_id: &str) -> Option<Decimal> {
+    let candidates = [
+        snapshot.eth_market.up_token.as_ref(),
+        snapshot.eth_market.down_token.as_ref(),
+        snapshot.btc_market.up_token.as_ref(),
+        snapshot.btc_market.down_token.as_ref(),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.token_id == token_id {
+            return candidate.bid;
+        }
+    }
+    None
 }
 
 // ─── Token ID extraction ──────────────────────────────────────────────────────
@@ -255,6 +471,35 @@ async fn main() -> Result<()> {
 
     let ws_url = config.polymarket.ws_url.clone();
     let mut current_period = current_15m_period();
+    let simulation_mode = env_bool_any_optional(&["SIMULATION_MODE", "SIM_MODE"]).unwrap_or(false);
+    let hold_seconds = std::env::var("SIM_HOLD_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20)
+        .max(1);
+
+    let sim_engine = Arc::new(Mutex::new(SimulationEngine::new(hold_seconds, dec!(100))));
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    if simulation_mode {
+        info!(
+            "🧪 SIMULATION_MODE enabled (stake=${:.2}, hold={}s)",
+            100.0, hold_seconds
+        );
+        info!("⌨️  Press SPACE (then Enter in some terminals) to stop simulation and print a detailed report");
+
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0_u8; 1];
+            loop {
+                if stdin.read_exact(&mut buf).is_ok() && buf[0] == b' ' {
+                    let _ = stop_tx.send(true);
+                    break;
+                }
+            }
+        });
+    }
 
     // ── Main outer loop — restarts every 15 minutes ───────────────────────────
     loop {
@@ -305,18 +550,31 @@ async fn main() -> Result<()> {
         let mut monitor = WsMarketMonitor::new(cache, tokens, ws_rx);
 
         // ── WS-driven monitoring task ──────────────────────────────────────
+        let sim_engine_for_monitor = sim_engine.clone();
         let monitor_handle = tokio::spawn({
             let detector = detector.clone();
             let trader = trader.clone();
+            let sim_engine = sim_engine_for_monitor.clone();
 
             async move {
                 monitor
                     .start(move |snapshot| {
                         let detector = detector.clone();
                         let trader = trader.clone();
+                        let sim_engine = sim_engine.clone();
+                        let simulation_mode = simulation_mode;
 
                         async move {
                             let opportunities = detector.detect_opportunities(&snapshot);
+
+                            if simulation_mode {
+                                let mut engine = sim_engine.lock().await;
+                                for opp in &opportunities {
+                                    engine.register_opportunity(opp);
+                                }
+                                engine.settle_due_positions(&snapshot);
+                                return;
+                            }
 
                             if !opportunities.is_empty() {
                                 info!("🔔 Found {} opportunity(ies)!", opportunities.len());
@@ -342,6 +600,19 @@ async fn main() -> Result<()> {
         // ── Wait for 15m period rollover ───────────────────────────────────
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            if simulation_mode && *stop_rx.borrow() {
+                info!("🛑 Space pressed — stopping simulation now");
+                monitor_handle.abort();
+
+                let report = {
+                    let engine = sim_engine.lock().await;
+                    engine.final_report()
+                };
+                println!("{}", report);
+                return Ok(());
+            }
+
             let new_period = current_15m_period();
             if new_period != current_period {
                 info!("⏰ 15m rollover — restarting WS feed for new markets");
