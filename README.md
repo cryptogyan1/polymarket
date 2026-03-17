@@ -63,6 +63,8 @@ FOK=false
 PAIR_BTC_ETH=true
 PAIR_BTC_SOL=false
 PAIR_BTC_XRP=false
+# switch main bot into sports-only scanner mode
+SPORTS_MODE=false
 # optional: per market-window cap, per direction (0 = unlimited)
 MAX_TRADES_PER_DIRECTION_PER_WINDOW=2
 # optional: max share exposure per market condition (0/unset = unlimited)
@@ -267,3 +269,40 @@ If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
 - `GET /journal/summary` returns aggregate execution stats from SQLite.
 - `GET /journal/recent?limit=50` returns recent journal rows.
 
+
+## Parallel sports market arbitrage scanner
+
+A dedicated binary is now included to discover and scan **all active binary sports markets** in parallel:
+
+```bash
+cargo run --bin sports_parallel_arb
+```
+
+It will:
+
+- fetch valid sports market types from `GET /sports/market-types`
+- fetch active events pages concurrently (`active=true&closed=false`)
+- extract active 2-outcome sports markets (e.g. MIA/CHA, O/U)
+- scan both outcome books for each market in parallel
+- emit opportunities when `OUTCOME_A_ASK + OUTCOME_B_ASK < ARBITRAGE_MAX_SUM`
+- optionally execute both BUY legs in parallel through the local executor
+
+Useful env vars:
+
+```env
+SPORTS_MODE=true
+SPORTS_MAX_DISCOVERY_PAGES=20
+SPORTS_DISCOVERY_CONCURRENCY=8
+SPORTS_SCAN_CONCURRENCY=128
+SPORTS_SCAN_INTERVAL_MS=250
+ARBITRAGE_MAX_SUM=0.985
+MIN_SHARES=5
+OPPORTUNITY_COOLDOWN_MS=5000
+
+# Optional live execution
+SPORTS_AUTO_TRADE=false
+SPORTS_TRADE_SIZE_USDC=5
+EXECUTOR_URL=http://127.0.0.1:8787
+```
+
+> Keep `SPORTS_AUTO_TRADE=false` until you validate logs and fills end-to-end.
