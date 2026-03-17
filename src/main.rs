@@ -73,6 +73,15 @@ struct SportsOpportunity {
     edge: f64,
 }
 
+#[derive(Debug, Default)]
+struct SportsScanReport {
+    opportunities: Vec<SportsOpportunity>,
+    markets_total: usize,
+    books_ready: usize,
+    min_liquidity_ready: usize,
+    below_sum_threshold: usize,
+}
+
 fn parse_env_bool(raw: &str) -> bool {
     matches!(
         raw.trim().to_ascii_lowercase().as_str(),
@@ -782,6 +791,13 @@ async fn run_sports_mode(
     );
     let sports_auto_trade = env_bool_any_optional(&["SPORTS_AUTO_TRADE"]).unwrap_or(false);
     let size_usdc = resolve_sports_trade_size_usdc(config);
+    let stats_log_every = Duration::from_millis(
+        std::env::var("SPORTS_STATS_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000)
+            .max(250),
+    );
 
     info!("🏈 Discovering active sports markets in parallel...");
     let markets = discover_sports_markets(&gamma_url, max_pages, page_concurrency)
@@ -794,10 +810,24 @@ async fn run_sports_mode(
     );
 
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
+    let mut last_stats_log = Instant::now() - stats_log_every;
 
     loop {
-        let opportunities =
+        let report =
             scan_sports_once(api.clone(), &markets, max_sum, min_size, scan_concurrency).await;
+        let opportunities = report.opportunities;
+
+        if last_stats_log.elapsed() >= stats_log_every {
+            info!(
+                "📈 SPORTS scan stats | markets_total={} quoted_now={} min_liq_now={} arb_candidates={} threshold={:.4}",
+                report.markets_total,
+                report.books_ready,
+                report.min_liquidity_ready,
+                report.below_sum_threshold,
+                max_sum
+            );
+            last_stats_log = Instant::now();
+        }
 
         for opp in opportunities {
             let key = opp.market.slug.clone();
@@ -876,8 +906,16 @@ async fn scan_sports_once(
     max_sum: f64,
     min_size: f64,
     concurrency: usize,
-) -> Vec<SportsOpportunity> {
-    stream::iter(markets.iter().cloned())
+) -> SportsScanReport {
+    #[derive(Debug)]
+    struct MarketScanResult {
+        has_books: bool,
+        has_min_liquidity: bool,
+        below_sum: bool,
+        opportunity: Option<SportsOpportunity>,
+    }
+
+    let per_market = stream::iter(markets.iter().cloned())
         .map(|market| {
             let api = api.clone();
             async move {
@@ -886,33 +924,85 @@ async fn scan_sports_once(
                     crate::execution::orderbook::fetch_orderbook(&api, &market.outcome_b_token)
                 );
 
-                let a_book = a_book.ok()?;
-                let b_book = b_book.ok()?;
+                let (Ok(a_book), Ok(b_book)) = (a_book, b_book) else {
+                    return MarketScanResult {
+                        has_books: false,
+                        has_min_liquidity: false,
+                        below_sum: false,
+                        opportunity: None,
+                    };
+                };
 
-                let (a_ask, a_size) = a_book.cheapest_ask_with_min_size(min_size)?;
-                let (b_ask, b_size) = b_book.cheapest_ask_with_min_size(min_size)?;
+                let (Some((a_ask, a_size)), Some((b_ask, b_size))) = (
+                    a_book.cheapest_ask_with_min_size(min_size),
+                    b_book.cheapest_ask_with_min_size(min_size),
+                ) else {
+                    return MarketScanResult {
+                        has_books: true,
+                        has_min_liquidity: false,
+                        below_sum: false,
+                        opportunity: None,
+                    };
+                };
+
                 if a_size < min_size || b_size < min_size {
-                    return None;
+                    return MarketScanResult {
+                        has_books: true,
+                        has_min_liquidity: false,
+                        below_sum: false,
+                        opportunity: None,
+                    };
                 }
 
                 let sum = a_ask + b_ask;
                 if sum >= max_sum {
-                    return None;
+                    return MarketScanResult {
+                        has_books: true,
+                        has_min_liquidity: true,
+                        below_sum: false,
+                        opportunity: None,
+                    };
                 }
 
-                Some(SportsOpportunity {
-                    market,
-                    outcome_a_ask: a_ask,
-                    outcome_b_ask: b_ask,
-                    sum,
-                    edge: 1.0 - sum,
-                })
+                MarketScanResult {
+                    has_books: true,
+                    has_min_liquidity: true,
+                    below_sum: true,
+                    opportunity: Some(SportsOpportunity {
+                        market,
+                        outcome_a_ask: a_ask,
+                        outcome_b_ask: b_ask,
+                        sum,
+                        edge: 1.0 - sum,
+                    }),
+                }
             }
         })
         .buffer_unordered(concurrency)
-        .filter_map(async move |x| x)
-        .collect()
-        .await
+        .collect::<Vec<MarketScanResult>>()
+        .await;
+
+    let mut report = SportsScanReport {
+        markets_total: markets.len(),
+        ..SportsScanReport::default()
+    };
+
+    for item in per_market {
+        if item.has_books {
+            report.books_ready += 1;
+        }
+        if item.has_min_liquidity {
+            report.min_liquidity_ready += 1;
+        }
+        if item.below_sum {
+            report.below_sum_threshold += 1;
+        }
+        if let Some(opp) = item.opportunity {
+            report.opportunities.push(opp);
+        }
+    }
+
+    report
 }
 
 async fn discover_sports_markets(
@@ -939,7 +1029,7 @@ async fn discover_sports_markets(
             }
         })
         .buffer_unordered(concurrency)
-        .collect()
+        .collect::<Vec<Vec<SportsMarket>>>()
         .await;
 
     let mut seen = HashSet::new();
