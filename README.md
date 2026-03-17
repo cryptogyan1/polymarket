@@ -298,8 +298,8 @@ Notes:
 - `ARBITRAGE_MAX_SUM`, `MIN_SHARES`, `OPPORTUNITY_COOLDOWN_MS`, and `EXECUTOR_URL` are reused from your normal bot env.
 - Trade size in sports mode defaults to your existing fixed size (`TRADE_MODE=FIXED` + `FIXED_USDC_PER_TRADE`).
 - `SPORTS_TRADE_SIZE_USDC` is optional and acts only as an explicit override.
-- Advanced tuning vars (`SPORTS_MAX_DISCOVERY_PAGES`, `SPORTS_DISCOVERY_CONCURRENCY`, `SPORTS_SCAN_CONCURRENCY`, `SPORTS_SCAN_INTERVAL_MS`, `SPORTS_STATS_LOG_INTERVAL_MS`) are optional; defaults are used if omitted.
+- Advanced tuning vars (`SPORTS_MAX_DISCOVERY_PAGES`, `SPORTS_DISCOVERY_CONCURRENCY`, `SPORTS_REDISCOVERY_INTERVAL_SECONDS`, `SPORTS_STATS_LOG_INTERVAL_MS`) are optional; defaults are used if omitted.
 
-> In sports mode, the bot now prints periodic scan stats (market totals / currently quoted / candidates) so it's clear the scanner is running even when no arb is found.
+> In sports mode, the bot now uses WS-driven checks (event-based) and prints periodic live stats (market totals / currently quoted / candidates), so it no longer looks stuck when no arb is found.
 
 > Keep `SPORTS_AUTO_TRADE=false` until you validate logs and fills end-to-end.
