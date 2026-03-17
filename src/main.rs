@@ -486,7 +486,7 @@ async fn main() -> Result<()> {
     let sports_mode = env_bool_any_optional(&["SPORTS_MODE"]).unwrap_or(false);
     if sports_mode {
         info!("🏈 SPORTS_MODE=true — running sports-only arbitrage scanner");
-        run_sports_mode(api.clone(), executor.clone()).await?;
+        run_sports_mode(api.clone(), executor.clone(), &config).await?;
         return Ok(());
     }
 
@@ -720,9 +720,32 @@ async fn discover_market(
     anyhow::bail!("No active {} market found", name)
 }
 
+fn resolve_sports_trade_size_usdc(config: &Config) -> f64 {
+    if let Ok(raw) = std::env::var("SPORTS_TRADE_SIZE_USDC") {
+        if let Ok(v) = raw.parse::<f64>() {
+            return v.max(1.0);
+        }
+    }
+
+    match config.trading.position_sizing.mode {
+        config::TradeMode::Fixed => config
+            .trading
+            .position_sizing
+            .fixed_usdc
+            .unwrap_or(5.0)
+            .max(1.0),
+        _ => std::env::var("FIXED_USDC_PER_TRADE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(5.0)
+            .max(1.0),
+    }
+}
+
 async fn run_sports_mode(
     api: Arc<PolymarketClient>,
     executor: Option<ExecutorClient>,
+    config: &Config,
 ) -> Result<()> {
     let gamma_url = api.gamma_url.clone();
     let max_sum = std::env::var("ARBITRAGE_MAX_SUM")
@@ -737,7 +760,7 @@ async fn run_sports_mode(
         std::env::var("SPORTS_SCAN_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(250),
+            .unwrap_or(config.trading.check_interval_ms.max(50)),
     );
     let max_pages = std::env::var("SPORTS_MAX_DISCOVERY_PAGES")
         .ok()
@@ -758,10 +781,7 @@ async fn run_sports_mode(
             .unwrap_or(5000),
     );
     let sports_auto_trade = env_bool_any_optional(&["SPORTS_AUTO_TRADE"]).unwrap_or(false);
-    let size_usdc = std::env::var("SPORTS_TRADE_SIZE_USDC")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(5.0);
+    let size_usdc = resolve_sports_trade_size_usdc(config);
 
     info!("🏈 Discovering active sports markets in parallel...");
     let markets = discover_sports_markets(&gamma_url, max_pages, page_concurrency)

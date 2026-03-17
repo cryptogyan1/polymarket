@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     let page_concurrency = env_u64("SPORTS_DISCOVERY_CONCURRENCY", 8) as usize;
     let scan_concurrency = env_u64("SPORTS_SCAN_CONCURRENCY", 128) as usize;
     let auto_trade = env_bool("SPORTS_AUTO_TRADE", false);
-    let size_usdc = env_f64("SPORTS_TRADE_SIZE_USDC", 5.0);
+    let size_usdc = resolve_sports_trade_size_usdc();
     let cooldown = Duration::from_millis(env_u64("OPPORTUNITY_COOLDOWN_MS", 5000));
 
     let executor = if auto_trade {
@@ -389,6 +389,28 @@ fn extract_binary_outcomes(v: &Value) -> Option<(String, String, String, String)
     None
 }
 
+fn resolve_sports_trade_size_usdc() -> f64 {
+    if let Ok(raw) = std::env::var("SPORTS_TRADE_SIZE_USDC") {
+        if let Ok(v) = raw.parse::<f64>() {
+            return v.max(1.0);
+        }
+    }
+
+    let mode = std::env::var("TRADE_MODE").unwrap_or_else(|_| "PERCENTAGE".to_string());
+    if mode.trim().eq_ignore_ascii_case("FIXED") {
+        return std::env::var("FIXED_USDC_PER_TRADE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(5.0)
+            .max(1.0);
+    }
+
+    std::env::var("FIXED_USDC_PER_TRADE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(5.0)
+        .max(1.0)
+}
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()

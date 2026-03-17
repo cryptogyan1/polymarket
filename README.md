@@ -287,22 +287,17 @@ It will:
 - emit opportunities when `OUTCOME_A_ASK + OUTCOME_B_ASK < ARBITRAGE_MAX_SUM`
 - optionally execute both BUY legs in parallel through the local executor
 
-Useful env vars:
+Minimal env setup (reuses your existing risk/sizing settings):
 
 ```env
 SPORTS_MODE=true
-SPORTS_MAX_DISCOVERY_PAGES=20
-SPORTS_DISCOVERY_CONCURRENCY=8
-SPORTS_SCAN_CONCURRENCY=128
-SPORTS_SCAN_INTERVAL_MS=250
-ARBITRAGE_MAX_SUM=0.985
-MIN_SHARES=5
-OPPORTUNITY_COOLDOWN_MS=5000
-
-# Optional live execution
 SPORTS_AUTO_TRADE=false
-SPORTS_TRADE_SIZE_USDC=5
-EXECUTOR_URL=http://127.0.0.1:8787
 ```
+
+Notes:
+- `ARBITRAGE_MAX_SUM`, `MIN_SHARES`, `OPPORTUNITY_COOLDOWN_MS`, and `EXECUTOR_URL` are reused from your normal bot env.
+- Trade size in sports mode defaults to your existing fixed size (`TRADE_MODE=FIXED` + `FIXED_USDC_PER_TRADE`).
+- `SPORTS_TRADE_SIZE_USDC` is optional and acts only as an explicit override.
+- Advanced tuning vars (`SPORTS_MAX_DISCOVERY_PAGES`, `SPORTS_DISCOVERY_CONCURRENCY`, `SPORTS_SCAN_CONCURRENCY`, `SPORTS_SCAN_INTERVAL_MS`) are optional; defaults are used if omitted.
 
 > Keep `SPORTS_AUTO_TRADE=false` until you validate logs and fills end-to-end.
