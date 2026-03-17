@@ -47,8 +47,8 @@ async fn main() -> Result<()> {
 
     let gamma_url = std::env::var("GAMMA_API_URL")
         .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
-    let clob_url = std::env::var("CLOB_API_URL")
-        .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+    let clob_url =
+        std::env::var("CLOB_API_URL").unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
 
     let api = Arc::new(PolymarketClient::new(
         gamma_url.clone(),
@@ -92,7 +92,8 @@ async fn main() -> Result<()> {
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
 
     loop {
-        let opportunities = scan_once(api.clone(), &markets, max_sum, min_size, scan_concurrency).await;
+        let opportunities =
+            scan_once(api.clone(), &markets, max_sum, min_size, scan_concurrency).await;
 
         for opp in opportunities {
             let key = opp.market.slug.clone();
@@ -215,7 +216,9 @@ async fn discover_sports_markets(
     concurrency: usize,
 ) -> Result<Vec<SportsMarket>> {
     let http = Client::new();
-    let market_types = fetch_market_types(&http, gamma_url).await.unwrap_or_default();
+    let market_types = fetch_market_types(&http, gamma_url)
+        .await
+        .unwrap_or_default();
 
     let offsets: Vec<usize> = (0..max_pages).map(|i| i * 100).collect();
 
@@ -267,7 +270,13 @@ async fn fetch_page_markets(
         offset
     );
 
-    let events: Vec<Value> = http.get(url).send().await?.error_for_status()?.json().await?;
+    let events: Vec<Value> = http
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     let mut markets = Vec::new();
 
     for event in events {

@@ -63,6 +63,8 @@ FOK=false
 PAIR_BTC_ETH=true
 PAIR_BTC_SOL=false
 PAIR_BTC_XRP=false
+# switch main bot into sports-only scanner mode
+SPORTS_MODE=false
 # optional: per market-window cap, per direction (0 = unlimited)
 MAX_TRADES_PER_DIRECTION_PER_WINDOW=2
 # optional: max share exposure per market condition (0/unset = unlimited)
@@ -288,6 +290,7 @@ It will:
 Useful env vars:
 
 ```env
+SPORTS_MODE=true
 SPORTS_MAX_DISCOVERY_PAGES=20
 SPORTS_DISCOVERY_CONCURRENCY=8
 SPORTS_SCAN_CONCURRENCY=128
