@@ -9,16 +9,22 @@
 ///   6. On 15m rollover: restart WS feed + monitor for new markets
 use polymarket_15m_arbitrage_bot::*;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use config::{Args, Config};
+use futures_util::{stream, StreamExt};
 use log::{info, warn};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
+
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::config::WalletConfig;
 use cache::PriceCache;
@@ -39,6 +45,24 @@ struct PairConfig {
     left_prefix: &'static str,
     right_name: &'static str,
     right_prefix: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct SportsMarket {
+    slug: String,
+    condition_id: String,
+    question: String,
+    outcome_a_label: String,
+    outcome_a_token: String,
+    outcome_b_label: String,
+    outcome_b_token: String,
+    sports_market_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SportsMarketTypesResponse {
+    #[serde(rename = "marketTypes", default)]
+    market_types: Vec<String>,
 }
 
 fn parse_env_bool(raw: &str) -> bool {
@@ -451,6 +475,13 @@ async fn main() -> Result<()> {
         clob.clone(),
     ));
 
+    let sports_mode = env_bool_any_optional(&["SPORTS_MODE"]).unwrap_or(false);
+    if sports_mode {
+        info!("🏈 SPORTS_MODE=true — running sports-only arbitrage scanner");
+        run_sports_mode(api.clone(), executor.clone(), &config).await?;
+        return Ok(());
+    }
+
     // ── Core objects ──────────────────────────────────────────────────────────
     let detector = Arc::new(ArbitrageDetector::new(config.trading.min_profit_threshold));
 
@@ -679,4 +710,540 @@ async fn discover_market(
     }
 
     anyhow::bail!("No active {} market found", name)
+}
+
+fn resolve_sports_trade_size_usdc(config: &Config) -> f64 {
+    if let Ok(raw) = std::env::var("SPORTS_TRADE_SIZE_USDC") {
+        if let Ok(v) = raw.parse::<f64>() {
+            return v.max(1.0);
+        }
+    }
+
+    match config.trading.position_sizing.mode {
+        config::TradeMode::Fixed => config
+            .trading
+            .position_sizing
+            .fixed_usdc
+            .unwrap_or(5.0)
+            .max(1.0),
+        _ => std::env::var("FIXED_USDC_PER_TRADE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(5.0)
+            .max(1.0),
+    }
+}
+
+async fn run_sports_mode(
+    api: Arc<PolymarketClient>,
+    executor: Option<ExecutorClient>,
+    config: &Config,
+) -> Result<()> {
+    let gamma_url = api.gamma_url.clone();
+    let ws_url = config.polymarket.ws_url.clone();
+
+    let max_sum = std::env::var("ARBITRAGE_MAX_SUM")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.985);
+    let min_size = std::env::var("MIN_SHARES")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(5.0);
+    let cooldown = Duration::from_millis(
+        std::env::var("OPPORTUNITY_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000),
+    );
+    let sports_auto_trade = env_bool_any_optional(&["SPORTS_AUTO_TRADE"]).unwrap_or(false);
+    let size_usdc = resolve_sports_trade_size_usdc(config);
+    let stats_log_every = Duration::from_millis(
+        std::env::var("SPORTS_STATS_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000)
+            .max(250),
+    );
+    let rediscovery_every = Duration::from_secs(
+        std::env::var("SPORTS_REDISCOVERY_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300)
+            .max(30),
+    );
+    let max_pages = std::env::var("SPORTS_MAX_DISCOVERY_PAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20);
+    let page_concurrency = std::env::var("SPORTS_DISCOVERY_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+
+    info!("🏈 Discovering active sports markets...");
+    let mut markets = discover_sports_markets(&gamma_url, max_pages, page_concurrency)
+        .await
+        .context("failed to discover sports markets")?;
+
+    let mut markets_by_condition: HashMap<String, SportsMarket> = HashMap::new();
+    let mut token_to_condition: HashMap<String, String> = HashMap::new();
+    rebuild_sports_indexes(&markets, &mut markets_by_condition, &mut token_to_condition);
+
+    let mut cache = PriceCache::new();
+    let mut ws_rx = spawn_ws_feed(
+        ws_url,
+        token_to_condition.keys().cloned().collect(),
+        cache.clone(),
+    );
+
+    info!(
+        "✅ Sports WS subscribed | active_markets={} tokens={}",
+        markets_by_condition.len(),
+        token_to_condition.len()
+    );
+
+    let mut last_seen: HashMap<String, Instant> = HashMap::new();
+    let mut stats_tick = tokio::time::interval(stats_log_every);
+    stats_tick.tick().await;
+    let mut rediscovery_tick = tokio::time::interval(rediscovery_every);
+    rediscovery_tick.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = stats_tick.tick() => {
+                let (quoted, min_liq, candidates) =
+                    compute_sports_live_stats(&markets, &cache, min_size, max_sum).await;
+                info!(
+                    "📈 SPORTS WS stats | markets_total={} quoted_now={} min_liq_now={} arb_candidates={} threshold={:.4}",
+                    markets.len(),
+                    quoted,
+                    min_liq,
+                    candidates,
+                    max_sum
+                );
+            }
+
+            _ = rediscovery_tick.tick() => {
+                match discover_sports_markets(&gamma_url, max_pages, page_concurrency).await {
+                    Ok(new_markets) => {
+                        let old_tokens: HashSet<String> = token_to_condition.keys().cloned().collect();
+                        let mut new_token_to_condition = HashMap::new();
+                        let mut new_markets_by_condition = HashMap::new();
+                        rebuild_sports_indexes(&new_markets, &mut new_markets_by_condition, &mut new_token_to_condition);
+                        let new_tokens: HashSet<String> = new_token_to_condition.keys().cloned().collect();
+
+                        if new_tokens != old_tokens {
+                            info!(
+                                "♻️ Sports universe changed | markets {} -> {} | tokens {} -> {} | restarting WS subscription",
+                                markets.len(), new_markets.len(), old_tokens.len(), new_tokens.len()
+                            );
+                            markets = new_markets;
+                            markets_by_condition = new_markets_by_condition;
+                            token_to_condition = new_token_to_condition;
+
+                            let new_cache = PriceCache::new();
+                            ws_rx = spawn_ws_feed(
+                                config.polymarket.ws_url.clone(),
+                                token_to_condition.keys().cloned().collect(),
+                                new_cache.clone(),
+                            );
+                            cache = new_cache;
+                        } else {
+                            markets = new_markets;
+                            markets_by_condition = new_markets_by_condition;
+                            token_to_condition = new_token_to_condition;
+                        }
+                    }
+                    Err(e) => warn!("⚠️ sports rediscovery failed: {}", e),
+                }
+            }
+
+            ws_msg = ws_rx.recv() => {
+                match ws_msg {
+                    Ok(update) => {
+                        let Some(condition_id) = token_to_condition.get(&update.token_id) else {
+                            continue;
+                        };
+                        let Some(market) = markets_by_condition.get(condition_id) else {
+                            continue;
+                        };
+
+                        let Some((a_price, b_price)) = evaluate_market_from_cache(market, &cache, min_size).await else {
+                            continue;
+                        };
+
+                        let sum = a_price + b_price;
+                        if sum >= max_sum {
+                            continue;
+                        }
+
+                        let key = market.slug.clone();
+                        if let Some(ts) = last_seen.get(&key) {
+                            if ts.elapsed() < cooldown {
+                                continue;
+                            }
+                        }
+                        last_seen.insert(key, Instant::now());
+
+                        let edge = 1.0 - sum;
+                        info!(
+                            "⚡ SPORTS ARB {} [{}] {} | {}={:.4} {}={:.4} SUM={:.4} EDGE={:.4}",
+                            market.slug,
+                            market
+                                .sports_market_type
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            market.question,
+                            market.outcome_a_label,
+                            a_price,
+                            market.outcome_b_label,
+                            b_price,
+                            sum,
+                            edge
+                        );
+
+                        if sports_auto_trade {
+                            let Some(exec) = executor.as_ref() else {
+                                warn!("SPORTS_AUTO_TRADE=true but executor is unavailable (set EXECUTION_MODE=executor)");
+                                continue;
+                            };
+
+                            let (a_res, b_res) = tokio::join!(
+                                exec.execute_order(
+                                    &market.outcome_a_token,
+                                    domain::order::Side::Buy,
+                                    a_price,
+                                    size_usdc,
+                                ),
+                                exec.execute_order(
+                                    &market.outcome_b_token,
+                                    domain::order::Side::Buy,
+                                    b_price,
+                                    size_usdc,
+                                )
+                            );
+
+                            match (a_res, b_res) {
+                                (Ok(a), Ok(b)) => info!(
+                                    "✅ placed sports legs market={} {}={:?} {}={:?}",
+                                    market.slug,
+                                    market.outcome_a_label,
+                                    a.order_id,
+                                    market.outcome_b_label,
+                                    b.order_id
+                                ),
+                                (Ok(_), Err(e)) => {
+                                    warn!(
+                                        "❌ second leg failed for {} | leg2_err={} | attempting emergency unwind on first leg",
+                                        market.slug,
+                                        e
+                                    );
+                                    let est_shares = (size_usdc / a_price.max(0.01)).max(1.0);
+                                    if let Err(unwind_err) = exec.cashout_position(&market.outcome_a_token, est_shares).await {
+                                        warn!("❌ emergency unwind failed on {}: {}", market.outcome_a_label, unwind_err);
+                                    }
+                                }
+                                (Err(e), Ok(_)) => {
+                                    warn!(
+                                        "❌ first leg failed for {} | leg1_err={} | attempting emergency unwind on second leg",
+                                        market.slug,
+                                        e
+                                    );
+                                    let est_shares = (size_usdc / b_price.max(0.01)).max(1.0);
+                                    if let Err(unwind_err) = exec.cashout_position(&market.outcome_b_token, est_shares).await {
+                                        warn!("❌ emergency unwind failed on {}: {}", market.outcome_b_label, unwind_err);
+                                    }
+                                }
+                                (Err(ae), Err(be)) => {
+                                    warn!(
+                                        "❌ sports execution failed for {} | {} {}",
+                                        market.slug, ae, be
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("⚠️ sports WS receiver lagged by {} messages", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("⚠️ sports WS channel closed; restarting subscription");
+                        ws_rx = spawn_ws_feed(
+                            config.polymarket.ws_url.clone(),
+                            token_to_condition.keys().cloned().collect(),
+                            cache.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rebuild_sports_indexes(
+    markets: &[SportsMarket],
+    markets_by_condition: &mut HashMap<String, SportsMarket>,
+    token_to_condition: &mut HashMap<String, String>,
+) {
+    markets_by_condition.clear();
+    token_to_condition.clear();
+
+    for market in markets {
+        markets_by_condition.insert(market.condition_id.clone(), market.clone());
+        token_to_condition.insert(market.outcome_a_token.clone(), market.condition_id.clone());
+        token_to_condition.insert(market.outcome_b_token.clone(), market.condition_id.clone());
+    }
+}
+
+async fn evaluate_market_from_cache(
+    market: &SportsMarket,
+    cache: &PriceCache,
+    min_size: f64,
+) -> Option<(f64, f64)> {
+    let a_book = cache.get(&market.outcome_a_token).await?;
+    let b_book = cache.get(&market.outcome_b_token).await?;
+
+    let a_price = avg_ask_price_for_size(&a_book.asks, min_size)?;
+    let b_price = avg_ask_price_for_size(&b_book.asks, min_size)?;
+
+    Some((a_price, b_price))
+}
+
+async fn compute_sports_live_stats(
+    markets: &[SportsMarket],
+    cache: &PriceCache,
+    min_size: f64,
+    max_sum: f64,
+) -> (usize, usize, usize) {
+    let mut quoted = 0usize;
+    let mut min_liq = 0usize;
+    let mut candidates = 0usize;
+
+    for market in markets {
+        let a = cache.get(&market.outcome_a_token).await;
+        let b = cache.get(&market.outcome_b_token).await;
+        let (Some(a), Some(b)) = (a, b) else {
+            continue;
+        };
+        quoted += 1;
+
+        let Some(a_price) = avg_ask_price_for_size(&a.asks, min_size) else {
+            continue;
+        };
+        let Some(b_price) = avg_ask_price_for_size(&b.asks, min_size) else {
+            continue;
+        };
+        min_liq += 1;
+
+        if a_price + b_price < max_sum {
+            candidates += 1;
+        }
+    }
+
+    (quoted, min_liq, candidates)
+}
+
+fn avg_ask_price_for_size(
+    asks: &[(rust_decimal::Decimal, rust_decimal::Decimal)],
+    target: f64,
+) -> Option<f64> {
+    if target <= 0.0 {
+        return Some(0.0);
+    }
+
+    let mut remaining = target;
+    let mut total_cost = 0.0;
+    for (price, size) in asks {
+        let p = price.to_f64()?;
+        let s = size.to_f64()?;
+        if s <= 0.0 {
+            continue;
+        }
+        let fill = remaining.min(s);
+        total_cost += fill * p;
+        remaining -= fill;
+        if remaining <= 0.0 {
+            return Some(total_cost / target);
+        }
+    }
+
+    None
+}
+
+async fn discover_sports_markets(
+    gamma_url: &str,
+    max_pages: usize,
+    concurrency: usize,
+) -> Result<Vec<SportsMarket>> {
+    let http = Client::new();
+    let market_types = fetch_sports_market_types(&http, gamma_url)
+        .await
+        .unwrap_or_default();
+
+    let offsets: Vec<usize> = (0..max_pages).map(|i| i * 100).collect();
+
+    let pages: Vec<Vec<SportsMarket>> = stream::iter(offsets)
+        .map(|offset| {
+            let http = http.clone();
+            let base = gamma_url.to_string();
+            let market_types = market_types.clone();
+            async move {
+                fetch_sports_page_markets(&http, &base, offset, &market_types)
+                    .await
+                    .unwrap_or_default()
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<Vec<SportsMarket>>>()
+        .await;
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for market in pages.into_iter().flatten() {
+        if seen.insert(market.condition_id.clone()) {
+            out.push(market);
+        }
+    }
+    Ok(out)
+}
+
+async fn fetch_sports_market_types(http: &Client, gamma_url: &str) -> Result<HashSet<String>> {
+    let url = format!("{}/sports/market-types", gamma_url.trim_end_matches('/'));
+    let resp = http.get(url).send().await?.error_for_status()?;
+    let body: SportsMarketTypesResponse = resp.json().await?;
+    Ok(body
+        .market_types
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect())
+}
+
+async fn fetch_sports_page_markets(
+    http: &Client,
+    gamma_url: &str,
+    offset: usize,
+    market_types: &HashSet<String>,
+) -> Result<Vec<SportsMarket>> {
+    let url = format!(
+        "{}/events?active=true&closed=false&limit=100&offset={}",
+        gamma_url.trim_end_matches('/'),
+        offset
+    );
+
+    let events: Vec<Value> = http
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut markets = Vec::new();
+
+    for event in events {
+        let event_markets = event
+            .get("markets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for m in event_markets {
+            if let Some(parsed) = parse_sports_market(&m, market_types) {
+                markets.push(parsed);
+            }
+        }
+    }
+
+    Ok(markets)
+}
+
+fn parse_sports_market(v: &Value, market_types: &HashSet<String>) -> Option<SportsMarket> {
+    if !v.get("active")?.as_bool()? || v.get("closed")?.as_bool()? {
+        return None;
+    }
+
+    let sports_type = v
+        .get("sportsMarketType")
+        .or_else(|| v.get("sports_market_type"))
+        .or_else(|| v.get("marketType"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_lowercase());
+
+    if !market_types.is_empty() {
+        if let Some(t) = sports_type.as_ref() {
+            if !market_types.contains(t) {
+                return None;
+            }
+        }
+    }
+
+    let condition_id = v.get("conditionId")?.as_str()?.to_string();
+    let slug = v.get("slug")?.as_str()?.to_string();
+    let question = v
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let (outcome_a_label, outcome_a_token, outcome_b_label, outcome_b_token) =
+        extract_sports_binary_outcomes(v)?;
+
+    Some(SportsMarket {
+        slug,
+        condition_id,
+        question,
+        outcome_a_label,
+        outcome_a_token,
+        outcome_b_label,
+        outcome_b_token,
+        sports_market_type: sports_type,
+    })
+}
+
+fn extract_sports_binary_outcomes(v: &Value) -> Option<(String, String, String, String)> {
+    if let Some(tokens) = v.get("tokens").and_then(Value::as_array) {
+        let parsed = tokens
+            .iter()
+            .filter_map(|t| {
+                let label = t.get("outcome")?.as_str()?.to_string();
+                let token = t
+                    .get("tokenId")
+                    .or_else(|| t.get("token_id"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                Some((label, token))
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+
+        if parsed.len() == 2 {
+            return Some((
+                parsed[0].0.clone(),
+                parsed[0].1.clone(),
+                parsed[1].0.clone(),
+                parsed[1].1.clone(),
+            ));
+        }
+    }
+
+    let outcomes = v
+        .get("outcomes")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())?;
+
+    let token_ids = v
+        .get("clobTokenIds")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())?;
+
+    if outcomes.len() >= 2 && token_ids.len() >= 2 {
+        return Some((
+            outcomes[0].clone(),
+            token_ids[0].clone(),
+            outcomes[1].clone(),
+            token_ids[1].clone(),
+        ));
+    }
+
+    None
 }

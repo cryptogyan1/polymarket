@@ -19,13 +19,17 @@ impl OrderBook {
         self.asks.first().cloned()
     }
 
-    /// Returns the cheapest ask level that can fill at least `min_size` shares.
+    /// Returns the volume-weighted average ask price needed to fill `min_size` shares,
+    /// plus the target size when fillable.
+    ///
+    /// This aggregates across multiple ask levels (not just a single level).
     pub fn cheapest_ask_with_min_size(&self, min_size: f64) -> Option<(f64, f64)> {
-        self.asks
-            .iter()
-            .filter(|(_, size)| *size >= min_size)
-            .min_by(|(price_a, _), (price_b, _)| price_a.total_cmp(price_b))
-            .cloned()
+        if min_size <= 0.0 {
+            return Some((0.0, 0.0));
+        }
+
+        let cost = self.estimated_buy_cost(min_size)?;
+        Some((cost / min_size, min_size))
     }
 
     pub fn estimated_buy_cost(&self, target_shares: f64) -> Option<f64> {
