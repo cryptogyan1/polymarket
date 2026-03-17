@@ -280,9 +280,9 @@ It will:
 
 - fetch valid sports market types from `GET /sports/market-types`
 - fetch active events pages concurrently (`active=true&closed=false`)
-- extract active binary YES/NO sports markets
-- scan YES+NO best asks for each market in parallel
-- emit opportunities when `YES_ASK + NO_ASK < ARBITRAGE_MAX_SUM`
+- extract active 2-outcome sports markets (e.g. MIA/CHA, O/U)
+- scan both outcome books for each market in parallel
+- emit opportunities when `OUTCOME_A_ASK + OUTCOME_B_ASK < ARBITRAGE_MAX_SUM`
 - optionally execute both BUY legs in parallel through the local executor
 
 Useful env vars:

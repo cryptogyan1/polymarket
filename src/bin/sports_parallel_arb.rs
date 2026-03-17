@@ -8,15 +8,21 @@ use polymarket_15m_arbitrage_bot::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::{HashMap, HashSet}, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone)]
 struct SportsMarket {
     slug: String,
     condition_id: String,
     question: String,
-    yes_token: String,
-    no_token: String,
+    outcome_a_label: String,
+    outcome_a_token: String,
+    outcome_b_label: String,
+    outcome_b_token: String,
     sports_market_type: Option<String>,
 }
 
@@ -29,8 +35,8 @@ struct SportsMarketTypesResponse {
 #[derive(Debug)]
 struct Opportunity {
     market: SportsMarket,
-    yes_ask: f64,
-    no_ask: f64,
+    outcome_a_ask: f64,
+    outcome_b_ask: f64,
     sum: f64,
     edge: f64,
 }
@@ -65,8 +71,8 @@ async fn main() -> Result<()> {
     let cooldown = Duration::from_millis(env_u64("OPPORTUNITY_COOLDOWN_MS", 5000));
 
     let executor = if auto_trade {
-        let url = std::env::var("EXECUTOR_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
+        let url =
+            std::env::var("EXECUTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
         Some(ExecutorClient::new(url)?)
     } else {
         None
@@ -78,7 +84,7 @@ async fn main() -> Result<()> {
         .context("failed to discover sports markets")?;
 
     println!(
-        "✅ Loaded {} active binary sports markets | scan interval={}ms",
+        "✅ Loaded {} active 2-outcome sports markets | scan interval={}ms",
         markets.len(),
         scan_interval.as_millis()
     );
@@ -98,34 +104,57 @@ async fn main() -> Result<()> {
             last_seen.insert(key, Instant::now());
 
             println!(
-                "⚡ arb {} [{}] {} | YES={:.4} NO={:.4} SUM={:.4} EDGE={:.4}",
+                "⚡ arb {} [{}] {} | {}={:.4} {}={:.4} SUM={:.4} EDGE={:.4}",
                 opp.market.slug,
-                opp.market.question,
                 opp.market
                     .sports_market_type
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                opp.yes_ask,
-                opp.no_ask,
+                opp.market.question,
+                opp.market.outcome_a_label,
+                opp.outcome_a_ask,
+                opp.market.outcome_b_label,
+                opp.outcome_b_ask,
                 opp.sum,
                 opp.edge
             );
 
             if let Some(exec) = &executor {
-                let (yes_res, no_res) = tokio::join!(
-                    exec.execute_order(&opp.market.yes_token, Side::Buy, opp.yes_ask, size_usdc),
-                    exec.execute_order(&opp.market.no_token, Side::Buy, opp.no_ask, size_usdc)
+                let (a_res, b_res) = tokio::join!(
+                    exec.execute_order(
+                        &opp.market.outcome_a_token,
+                        Side::Buy,
+                        opp.outcome_a_ask,
+                        size_usdc
+                    ),
+                    exec.execute_order(
+                        &opp.market.outcome_b_token,
+                        Side::Buy,
+                        opp.outcome_b_ask,
+                        size_usdc
+                    )
                 );
 
-                match (yes_res, no_res) {
-                    (Ok(y), Ok(n)) => {
+                match (a_res, b_res) {
+                    (Ok(a), Ok(b)) => {
                         println!(
-                            "✅ placed both legs market={} yes_order={:?} no_order={:?}",
-                            opp.market.slug, y.order_id, n.order_id
+                            "✅ placed both legs market={} {}={:?} {}={:?}",
+                            opp.market.slug,
+                            opp.market.outcome_a_label,
+                            a.order_id,
+                            opp.market.outcome_b_label,
+                            b.order_id
                         );
                     }
                     (a, b) => {
-                        eprintln!("❌ execution failed for {} | yes={:?} no={:?}", opp.market.slug, a, b);
+                        eprintln!(
+                            "❌ execution failed for {} | {}={:?} {}={:?}",
+                            opp.market.slug,
+                            opp.market.outcome_a_label,
+                            a,
+                            opp.market.outcome_b_label,
+                            b
+                        );
                     }
                 }
             }
@@ -146,29 +175,29 @@ async fn scan_once(
         .map(|market| {
             let api = api.clone();
             async move {
-                let (yes_book, no_book) = tokio::join!(
-                    fetch_orderbook(&api, &market.yes_token),
-                    fetch_orderbook(&api, &market.no_token)
+                let (a_book, b_book) = tokio::join!(
+                    fetch_orderbook(&api, &market.outcome_a_token),
+                    fetch_orderbook(&api, &market.outcome_b_token)
                 );
 
-                let yes_book = yes_book.ok()?;
-                let no_book = no_book.ok()?;
+                let a_book = a_book.ok()?;
+                let b_book = b_book.ok()?;
 
-                let (yes_ask, yes_size) = yes_book.cheapest_ask_with_min_size(min_size)?;
-                let (no_ask, no_size) = no_book.cheapest_ask_with_min_size(min_size)?;
-                if yes_size < min_size || no_size < min_size {
+                let (a_ask, a_size) = a_book.cheapest_ask_with_min_size(min_size)?;
+                let (b_ask, b_size) = b_book.cheapest_ask_with_min_size(min_size)?;
+                if a_size < min_size || b_size < min_size {
                     return None;
                 }
 
-                let sum = yes_ask + no_ask;
+                let sum = a_ask + b_ask;
                 if sum >= max_sum {
                     return None;
                 }
 
                 Some(Opportunity {
                     market,
-                    yes_ask,
-                    no_ask,
+                    outcome_a_ask: a_ask,
+                    outcome_b_ask: b_ask,
                     sum,
                     edge: 1.0 - sum,
                 })
@@ -195,7 +224,11 @@ async fn discover_sports_markets(
             let http = http.clone();
             let base = gamma_url.to_string();
             let market_types = market_types.clone();
-            async move { fetch_page_markets(&http, &base, offset, &market_types).await.unwrap_or_default() }
+            async move {
+                fetch_page_markets(&http, &base, offset, &market_types)
+                    .await
+                    .unwrap_or_default()
+            }
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -215,7 +248,11 @@ async fn fetch_market_types(http: &Client, gamma_url: &str) -> Result<HashSet<St
     let url = format!("{}/sports/market-types", gamma_url.trim_end_matches('/'));
     let resp = http.get(url).send().await?.error_for_status()?;
     let body: SportsMarketTypesResponse = resp.json().await?;
-    Ok(body.market_types.into_iter().map(|s| s.to_lowercase()).collect())
+    Ok(body
+        .market_types
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect())
 }
 
 async fn fetch_page_markets(
@@ -262,10 +299,13 @@ fn parse_sports_market(v: &Value, market_types: &HashSet<String>) -> Option<Spor
         .and_then(Value::as_str)
         .map(|s| s.to_lowercase());
 
+    // Keep markets if type is missing (some payload variants omit it),
+    // but when present and we have a known valid-type set, enforce it.
     if !market_types.is_empty() {
-        let t = sports_type.as_ref()?;
-        if !market_types.contains(t) {
-            return None;
+        if let Some(t) = sports_type.as_ref() {
+            if !market_types.contains(t) {
+                return None;
+            }
         }
     }
 
@@ -277,46 +317,64 @@ fn parse_sports_market(v: &Value, market_types: &HashSet<String>) -> Option<Spor
         .unwrap_or("")
         .to_string();
 
-    let (yes_token, no_token) = extract_yes_no_tokens(v)?;
+    let (outcome_a_label, outcome_a_token, outcome_b_label, outcome_b_token) =
+        extract_binary_outcomes(v)?;
 
     Some(SportsMarket {
         slug,
         condition_id,
         question,
-        yes_token,
-        no_token,
+        outcome_a_label,
+        outcome_a_token,
+        outcome_b_label,
+        outcome_b_token,
         sports_market_type: sports_type,
     })
 }
 
-fn extract_yes_no_tokens(v: &Value) -> Option<(String, String)> {
+fn extract_binary_outcomes(v: &Value) -> Option<(String, String, String, String)> {
     if let Some(tokens) = v.get("tokens").and_then(Value::as_array) {
-        let mut yes = None;
-        let mut no = None;
-        for t in tokens {
-            let outcome = t.get("outcome")?.as_str()?.to_ascii_uppercase();
-            let token_id = t
-                .get("tokenId")
-                .or_else(|| t.get("token_id"))
-                .and_then(Value::as_str)?
-                .to_string();
-            if outcome == "YES" {
-                yes = Some(token_id);
-            } else if outcome == "NO" {
-                no = Some(token_id);
-            }
-        }
-        if let (Some(y), Some(n)) = (yes, no) {
-            return Some((y, n));
+        let parsed = tokens
+            .iter()
+            .filter_map(|t| {
+                let label = t.get("outcome")?.as_str()?.to_string();
+                let token = t
+                    .get("tokenId")
+                    .or_else(|| t.get("token_id"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                Some((label, token))
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+
+        if parsed.len() == 2 {
+            return Some((
+                parsed[0].0.clone(),
+                parsed[0].1.clone(),
+                parsed[1].0.clone(),
+                parsed[1].1.clone(),
+            ));
         }
     }
 
-    if let Some(raw) = v.get("clobTokenIds").and_then(Value::as_str) {
-        if let Ok(ids) = serde_json::from_str::<Vec<String>>(raw) {
-            if ids.len() >= 2 {
-                return Some((ids[0].clone(), ids[1].clone()));
-            }
-        }
+    let outcomes = v
+        .get("outcomes")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())?;
+
+    let token_ids = v
+        .get("clobTokenIds")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())?;
+
+    if outcomes.len() >= 2 && token_ids.len() >= 2 {
+        return Some((
+            outcomes[0].clone(),
+            token_ids[0].clone(),
+            outcomes[1].clone(),
+            token_ids[1].clone(),
+        ));
     }
 
     None
