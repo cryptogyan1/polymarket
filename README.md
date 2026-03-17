@@ -63,6 +63,8 @@ FOK=false
 PAIR_BTC_ETH=true
 PAIR_BTC_SOL=false
 PAIR_BTC_XRP=false
+# switch main bot into sports-only scanner mode
+SPORTS_MODE=false
 # optional: per market-window cap, per direction (0 = unlimited)
 MAX_TRADES_PER_DIRECTION_PER_WINDOW=2
 # optional: max share exposure per market condition (0/unset = unlimited)
@@ -267,3 +269,37 @@ If you see `CLAIM failed: failed connecting to TELEGRAM_CONTROL_RPC_URL`:
 - `GET /journal/summary` returns aggregate execution stats from SQLite.
 - `GET /journal/recent?limit=50` returns recent journal rows.
 
+
+## Parallel sports market arbitrage scanner
+
+A dedicated binary is now included to discover and scan **all active binary sports markets** in parallel:
+
+```bash
+cargo run --bin sports_parallel_arb
+```
+
+It will:
+
+- fetch valid sports market types from `GET /sports/market-types`
+- fetch active events pages concurrently (`active=true&closed=false`)
+- extract active 2-outcome sports markets (e.g. MIA/CHA, O/U)
+- scan both outcome books for each market in parallel
+- emit opportunities when `OUTCOME_A_ASK + OUTCOME_B_ASK < ARBITRAGE_MAX_SUM`
+- optionally execute both BUY legs in parallel through the local executor
+
+Minimal env setup (reuses your existing risk/sizing settings):
+
+```env
+SPORTS_MODE=true
+SPORTS_AUTO_TRADE=false
+```
+
+Notes:
+- `ARBITRAGE_MAX_SUM`, `MIN_SHARES`, `OPPORTUNITY_COOLDOWN_MS`, and `EXECUTOR_URL` are reused from your normal bot env.
+- Trade size in sports mode defaults to your existing fixed size (`TRADE_MODE=FIXED` + `FIXED_USDC_PER_TRADE`).
+- `SPORTS_TRADE_SIZE_USDC` is optional and acts only as an explicit override.
+- Advanced tuning vars (`SPORTS_MAX_DISCOVERY_PAGES`, `SPORTS_DISCOVERY_CONCURRENCY`, `SPORTS_SCAN_CONCURRENCY`, `SPORTS_SCAN_INTERVAL_MS`, `SPORTS_STATS_LOG_INTERVAL_MS`) are optional; defaults are used if omitted.
+
+> In sports mode, the bot now prints periodic scan stats (market totals / currently quoted / candidates) so it's clear the scanner is running even when no arb is found.
+
+> Keep `SPORTS_AUTO_TRADE=false` until you validate logs and fills end-to-end.
